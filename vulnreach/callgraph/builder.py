@@ -88,12 +88,49 @@ class CallGraphBuilder:
         self._current_class: str | None = None
         self._current_caller: CallNode | None = None
 
+    # ------------------------------------------------------------------ cached subgraph
+
+    def add_cached_subgraph(
+        self,
+        nodes: list[dict[str, Any]],
+        edges: list[dict[str, Any]],
+    ) -> None:
+        """Add a pre-built (cached) dependency subgraph to the graph.
+
+        Nodes are dicts with ``qualname``, ``file``, ``line``; edges are dicts
+        with ``source``, ``target`` and optional ``over_approx``.  This lets the
+        CLI reuse a previously cached call graph for a dependency without
+        re-parsing its source files.
+        """
+        for node in nodes:
+            call_node = CallNode(
+                qualname=node["qualname"],
+                file=node.get("file", ""),
+                line=int(node.get("line", 1)),
+            )
+            self.graph.add_node(call_node)
+            self._name_index.setdefault(call_node.qualname.split(".")[-1], []).append(
+                call_node
+            )
+        for edge in edges:
+            source = self._find_node(edge["source"])
+            target = self._find_node(edge["target"])
+            if source is None or target is None:
+                continue
+            self.graph.add_edge(
+                source, target, over_approx=bool(edge.get("over_approx", False))
+            )
+
     # ------------------------------------------------------------------ public
 
-    def build(self, dependency_name: str | None = None) -> CallGraphResult:
+    def build(
+        self,
+        dependency_name: str | None = None,
+        include_dependency: bool = True,
+    ) -> CallGraphResult:
         self._reset()
         files = self._collect_project_files()
-        if dependency_name:
+        if dependency_name and include_dependency:
             files.extend(self._collect_dependency_files(dependency_name))
 
         # Pass 1: parse + collect definitions, imports, classes, instance types
