@@ -110,6 +110,11 @@ class DynamicDetector:
                 self._add(file, node.lineno, name.upper(), f"{name}(...)")
                 return
 
+            # entry_points() called by bare name (from importlib.metadata import entry_points)
+            if name == "entry_points":
+                self._add(file, node.lineno, self.ENTRY_POINTS, "entry_points()")
+                return
+
         # attribute calls: importlib.import_module(...), pkgutil.iter_modules(),
         # entry_points(), pkg_resources..., pickle.loads, yaml.load
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
@@ -128,11 +133,20 @@ class DynamicDetector:
                 return
 
             # pkg_resources / importlib.metadata entry_points
-            if self._is_name(value, ("pkg_resources", "importlib.metadata")) and attr == "entry_points":
-                self._add(file, node.lineno, self.ENTRY_POINTS, f"{value.attr if isinstance(value, ast.Attribute) else value.id}.entry_points()")
+            if attr == "entry_points" and self._is_importlib_metadata(value):
+                self._add(file, node.lineno, self.ENTRY_POINTS, "entry_points()")
                 return
             if isinstance(value, ast.Attribute) and self._is_name(value.value, "pkg_resources") and value.attr == "iter_entry_points":
                 self._add(file, node.lineno, self.PKG_RESOURCES, "pkg_resources.iter_entry_points()")
+                return
+
+            # object.__subclasses__() -- can iterate over every loaded class
+            if (
+                attr == "__subclasses__"
+                and isinstance(value, ast.Name)
+                and value.id == "object"
+            ):
+                self._add(file, node.lineno, "subclasses", "object.__subclasses__()")
                 return
 
             # pickle.loads / pickle.load (unsafe)
@@ -187,6 +201,16 @@ class DynamicDetector:
         if isinstance(names, str):
             return node.id == names
         return node.id in names
+
+    @staticmethod
+    def _is_importlib_metadata(node: ast.AST) -> bool:
+        """Return True if ``node`` is ``importlib.metadata`` (Name or Attribute chain)."""
+        if isinstance(node, ast.Name):
+            return node.id == "importlib.metadata"
+        if isinstance(node, ast.Attribute):
+            if node.attr == "metadata":
+                return isinstance(node.value, ast.Name) and node.value.id == "importlib"
+        return False
 
     def _add(self, file: str, line: int, kind: str, detail: str = "") -> None:
         self.sites.append(DynamicSite(file=file, line=line, kind=kind, detail=detail))

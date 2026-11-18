@@ -4,9 +4,10 @@ For each alert (plus the vulnerable functions resolved from its fix commit) the
 analyzer decides whether the vulnerable code can be reached from project code:
 
 1. ``functions_unknown``            -> ``uncertain`` (we cannot rule anything out)
-2. static call path to a vulnerable function -> ``reachable`` (shortest path)
-3. no static path, but dynamic sites could hide one -> ``uncertain``
-4. no static path and no dynamic sites -> ``not_reachable``
+2. unresolved call sites            -> ``uncertain`` (a hidden call could reach the target)
+3. static call path to a vulnerable function -> ``reachable`` (shortest path)
+4. no static path, but dynamic sites could hide one -> ``uncertain``
+5. no static path and no dynamic sites -> ``not_reachable``
 
 Every verdict carries evidence (the call path, file:line per hop), a confidence
 level with a short reason, and a human-readable explanation.  Per the project's
@@ -91,7 +92,29 @@ class ReachabilityAnalyzer:
                 ),
             )
 
-        # Step 3: locate target nodes in the graph and search for a path.
+        # Step 3: unresolved call sites could hide a path to the vulnerable
+        # function.  This check runs *before* the path search so that a resolved
+        # path cannot mask an unresolved call that might reach the same target
+        # through a different route.  Soundness over precision.
+        unresolved = list(getattr(self.call_graph, "unresolved_calls", []))
+        if unresolved:
+            joined = ", ".join(unresolved[:5])
+            suffix = "" if len(unresolved) <= 5 else f" (+{len(unresolved) - 5} more)"
+            return self._uncertain(
+                alert,
+                reasons=[
+                    f"unresolved call site(s) could reach the vulnerable function: {joined}{suffix}"
+                ],
+                blockers=unresolved,
+                explanation=(
+                    f"Uncertain: {alert.package}@{alert.version} "
+                    f"({alert.advisory_id}) -- the analysis found call site(s) that "
+                    f"could not be resolved to a graph node and might reach the "
+                    f"vulnerable function through a hidden path."
+                ),
+            )
+
+        # Step 4: locate target nodes in the graph and search for a path.
         target_nodes, target_problems = self._target_nodes(vulnerable_functions)
         best_path: list[CallNode] | None = None
 
@@ -137,7 +160,7 @@ class ReachabilityAnalyzer:
                 explanation=explanation,
             )
 
-        # Step 4: positive-evidence gate.  ``not_reachable`` is a negative claim
+        # Step 5: positive-evidence gate.  ``not_reachable`` is a negative claim
         # about the whole program, so it is allowed only when every precondition
         # documented in :meth:`_positive_evidence_gate` holds.  Any violation
         # degrades the verdict to ``uncertain``.
@@ -168,7 +191,7 @@ class ReachabilityAnalyzer:
                 explanation=explanation,
             )
 
-        # Step 5: every precondition holds and there is no path -> not_reachable.
+        # Step 6: every precondition holds and there is no path -> not_reachable.
         confidence = "high" if fix_commit.resolution_method == "direct_link" else "medium"
         target_names = ", ".join(vf.qualified_name for vf in vulnerable_functions) or "<none identified>"
         reasons = [

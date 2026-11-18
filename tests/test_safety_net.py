@@ -318,3 +318,49 @@ def test_cli_reports_isolated_runtime_error_without_traceback(
     assert code == 1
     assert "isolated analysis failed" in captured.err
     assert "Traceback" not in captured.err
+
+
+# ------------------------------------------------------------------ call accounting
+
+
+def test_call_accounting_complete(tmp_path):
+    """Every ast.Call node must be accounted for: edge, dynamic site, or external.
+
+    If the number of Call nodes seen differs from the number accounted for,
+    some call could be silently dropped -- potentially hiding a path to the
+    vulnerable function.
+    """
+    import ast
+
+    project = _write(
+        tmp_path,
+        {
+            "lib.py": LIB,
+            "main.py": (
+                "import lib\n"
+                "x = lib.vulnerable()\n"
+                "print(lib.vulnerable())\n"
+                "if lib.vulnerable():\n"
+                "    pass\n"
+                "f = lambda: lib.vulnerable()\n"
+                "f()\n"
+            ),
+        },
+    )
+    builder = CallGraphBuilder(project)
+    builder.build()
+
+    # Count all Call nodes via ast.walk across every parsed file.
+    seen: set[tuple[str, int]] = set()
+    for _module, path, tree in builder._files:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                seen.add((str(path), node.lineno))
+
+    accounted = builder._accounted_calls
+    missing = seen - accounted
+    extra = accounted - seen
+    assert not missing, f"unaccounted call sites: {missing}"
+    assert not extra, f"spurious accounted calls: {extra}"
+    assert len(seen) == len(accounted)
+
