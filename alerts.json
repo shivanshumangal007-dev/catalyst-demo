@@ -1,0 +1,14 @@
+[
+  {
+    "package": "requests",
+    "version": "2.25.0",
+    "advisory_id": "GHSA-cc3m-4wpp-2x39",
+    "aliases": ["CVE-2020-26137", "PYSEC-2020-220"]
+  },
+  {
+    "package": "django",
+    "version": "3.1.0",
+    "advisory_id": "PYSEC-2021-35",
+    "aliases": ["CVE-2021-23338"]
+  }
+]
