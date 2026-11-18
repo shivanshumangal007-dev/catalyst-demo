@@ -28,8 +28,9 @@ DEFAULT_TIMEOUT = 20
 class OSVClient:
     """Thin, cached client over the OSV REST API."""
 
-    def __init__(self, cache_db: str | Path | None = None, timeout: int = DEFAULT_TIMEOUT) -> None:
+    def __init__(self, cache_db: str | Path | None = None, timeout: int = DEFAULT_TIMEOUT, enabled: bool = True) -> None:
         self.timeout = timeout
+        self.enabled = enabled
         self.cache_db = Path(cache_db) if cache_db else Path.home() / ".cache" / "vulnreach" / "osv.sqlite"
         self.cache_db.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
@@ -49,6 +50,8 @@ class OSVClient:
     # ------------------------------------------------------------------ cache
 
     def _read_cache(self, key: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
         try:
             with sqlite3.connect(self.cache_db) as conn:
                 row = conn.execute(
@@ -61,6 +64,8 @@ class OSVClient:
             return None
 
     def _write_cache(self, key: str, data: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
         try:
             with sqlite3.connect(self.cache_db) as conn:
                 conn.execute(

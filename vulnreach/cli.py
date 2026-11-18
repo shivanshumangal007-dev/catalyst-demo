@@ -4,12 +4,11 @@
 full pipeline:
 
 1. Load alerts
-2. Resolve fix commits (OSV) — results are cached per ``package@version`` so
+2. Resolve fix commits (OSV) -- results are cached per ``package@version`` so
    popular packages are analyzed once and reused across projects
-3. Convert fix commits to vulnerable functions (diff -> functions) — cached too
-4. Build a call graph of the project (+ dependency) — the dependency subgraph
-   is cached per ``package@version``
-5. Analyze reachability for each alert
+3. Convert fix commits to vulnerable functions (diff -> functions) -- cached too
+4. Build a call graph of the project (+ all alert dependency packages)
+5. Analyze reachability for each alert against the shared graph
 6. Emit report.json (all verdicts) and report.vex.json (OpenVEX document)
 7. Print a readable terminal table
 
@@ -33,11 +32,11 @@ from typing import Any
 
 from vulnreach.advisories.fix_commit import FixCommit, FixCommitResolver
 from vulnreach.advisories.osv_client import OSVClient
-from vulnreach.callgraph.builder import CallGraphBuilder, CallGraphResult, CallNode
+from vulnreach.callgraph.builder import CallGraphBuilder, CallGraphResult, CallNode, _CallVisitor
 from vulnreach.callgraph.dynamic_detector import DynamicDetector
 from vulnreach.cache.store import CacheStore
-from vulnreach.diffing.diff_to_functions import DiffToFunctions
-from vulnreach.models import Alert, PathHop, Verdict, VulnerableFunction
+from vulnreach.diffing.diff_to_functions import DiffToFunctions, VulnerableFunction
+from vulnreach.models import Alert, PathHop, Verdict
 from vulnreach.reachability.analyzer import ReachabilityAnalyzer
 from vulnreach.vex.openvex import build_document, write_vex
 
@@ -108,65 +107,172 @@ def _run_pipeline(
     project_path: Path,
     alerts: list[dict[str, Any]],
     cache: CacheStore,
+    cache_enabled: bool = True,
 ) -> tuple[list[Verdict], list[FixCommit], CallGraphResult]:
     """Run the full analysis pipeline with caching.
 
     For each alert, the advisory -> vulnerable functions resolution is looked up
     in the cache first (keyed by ``package@version``).  On a miss it is resolved
-    via OSV + fix commit + diff parsing and stored.  The dependency call graph
-    subgraph is cached and reused when available.
+    via OSV + fix commit + diff parsing and stored.
+
+    One shared call graph is built that includes *all* alert dependency
+    packages, so every alert's vulnerable functions can be resolved against the
+    same graph (fixes F-15: multi-alert scans only modeled the first package).
     """
-    client = OSVClient()
-    resolver = FixCommitResolver()
+    client = OSVClient(enabled=cache_enabled)
+    resolver = FixCommitResolver(enabled=cache_enabled)
     diff_to_funcs = DiffToFunctions()
 
-    # Identify the target dependency from the first alert (the vulnerable package).
-    first_package = alerts[0].get("package", "") if alerts else ""
-    first_version = alerts[0].get("version", "") if alerts else ""
+    # ---- Collect all unique alert packages for the shared call graph.
+    dep_packages: dict[str, str] = {}
+    for alert_data in alerts:
+        pkg = alert_data.get("package", "")
+        ver = alert_data.get("version", "")
+        if pkg and pkg not in dep_packages:
+            dep_packages[pkg] = ver
 
-    # ---- Call graph: use cached dependency subgraph when available.
+    # ---- Build one call graph including every alert dependency package.
     builder = CallGraphBuilder(project_path)
-    dependency_name = first_package or None
-    dependency_version = first_version or None
     call_graph: CallGraphResult | None = None
+    dynamic_sites: list[Any] = []
 
-    if dependency_name and dependency_version:
-        cached_cg = cache.get(dependency_name, dependency_version, "callgraph")
-        if cached_cg is not None:
-            logger.info("reusing cached call graph for %s@%s", dependency_name, dependency_version)
-            nodes, edges = CacheStore.deserialize_graph(cached_cg)
-            builder.build(dependency_name=dependency_name, include_dependency=False)
-            builder.add_cached_subgraph(nodes, edges)
-            # Dependency module-level code runs on import, so treat it as an
-            # entry point too (keeps cached graphs sound for reachability).
-            dep_module_node = CallNode(
-                qualname=f"{dependency_name}.<module>", file="", line=1
+    if dep_packages:
+        # Check cache for every package; build missing ones.
+        missing_packages: list[tuple[str, str]] = []
+        cached_nodes: list[dict[str, Any]] = []
+        cached_edges: list[dict[str, Any]] = []
+
+        for pkg, ver in dep_packages.items():
+            cached_cg = cache.get(pkg, ver, "callgraph")
+            if cached_cg is not None:
+                logger.info("reusing cached call graph for %s@%s", pkg, ver)
+                nodes, edges = CacheStore.deserialize_graph(cached_cg)
+                cached_nodes.extend(nodes)
+                cached_edges.extend(edges)
+            else:
+                missing_packages.append((pkg, ver))
+
+        # Build the graph with all missing packages at once.
+        builder.build(dependency_name=None, include_dependency=False)
+        if missing_packages:
+            # Collect dependency files for all missing packages.
+            all_dep_files: list[tuple[str, Path]] = []
+            for pkg, ver in missing_packages:
+                dep_files = builder._collect_dependency_files(pkg)
+                all_dep_files.extend(dep_files)
+
+            # Parse and collect definitions for dependency files.
+            for module, path in all_dep_files:
+                tree = builder._parse_file(path)
+                if tree is None:
+                    continue
+                builder._files.append((module, path, tree))
+                builder._collect_definitions(module, tree)
+
+            # Initialize per-module bookkeeping for all files (project + deps).
+            builder._dynamic_imports = {
+                module: set() for module, _, _ in builder._files
+            }
+            builder._dict_bindings = {module: {} for module, _, _ in builder._files}
+
+            # Dynamic detection for all files.
+            detector = DynamicDetector()
+            all_dynamic = detector.detect(project_path, builder._files)
+            builder._dynamic_site_index = {}
+            for site in all_dynamic:
+                builder._dynamic_site_index[(site.file, site.line)] = site
+            dynamic_sites.extend(all_dynamic)
+
+            # Re-run call resolution on ALL files (project + dependencies) so
+            # cross-package edges (e.g. main() -> dep.api.public) are resolved.
+            for module, path, tree in builder._files:
+                module_node = CallNode(
+                    qualname=f"{module}.<module>",
+                    file=builder._display_file(path),
+                    line=1,
+                )
+                if not builder.graph.has_node(module_node):
+                    builder.graph.add_node(module_node)
+                builder._name_index.setdefault("<module>", []).append(module_node)
+                visitor = _CallVisitor(builder, module, path, module_node)
+                visitor.visit(tree)
+                builder._accounted_calls.update(visitor.accounted_calls)
+                builder._all_call_sites.extend(visitor.all_call_sites)
+
+            # Compute unresolved calls.
+            for file_path, line, _rendered in builder._all_call_sites:
+                if (file_path, line) not in builder._accounted_calls:
+                    pass  # _add_call_edge / _CallVisitor already recorded dep-targeted ones
+
+            # Cache each package's subgraph.
+            for pkg, ver in missing_packages:
+                dep_prefix = pkg + "."
+                dep_nodes: list[dict[str, Any]] = []
+                dep_edges: list[dict[str, Any]] = []
+                for node in builder.graph.nodes:
+                    if (
+                        node.qualname == f"{pkg}.<module>"
+                        or node.qualname.startswith(dep_prefix)
+                    ):
+                        dep_nodes.append(
+                            {"qualname": node.qualname, "file": node.file, "line": node.line}
+                        )
+                for source, target, data in builder.graph.edges(data=True):
+                    if (
+                        source.qualname == f"{pkg}.<module>"
+                        or source.qualname.startswith(dep_prefix)
+                    ) and (
+                        target.qualname == f"{pkg}.<module>"
+                        or target.qualname.startswith(dep_prefix)
+                    ):
+                        dep_edges.append(
+                            {
+                                "source": source.qualname,
+                                "target": target.qualname,
+                                "over_approx": bool(data.get("over_approx", False)),
+                            }
+                        )
+                cache.put(
+                    pkg,
+                    ver,
+                    "callgraph",
+                    CacheStore.serialize_graph(dep_nodes, dep_edges),
+                )
+
+        # Add cached subgraphs to the graph.  Nodes are also registered in
+        # _file_functions so _find_node / _resolve_name_call can locate them
+        # precisely (cold and warm cache runs must produce identical verdicts).
+        for node in cached_nodes:
+            call_node = CallNode(
+                qualname=node["qualname"],
+                file=node.get("file", ""),
+                line=int(node.get("line", 1)),
             )
+            builder.graph.add_node(call_node)
+            builder._name_index.setdefault(call_node.qualname.split(".")[-1], []).append(
+                call_node
+            )
+            # Register in _file_functions for precise resolution.
+            parts = call_node.qualname.split(".")
+            if len(parts) > 1:
+                mod_name = parts[0]
+                func_qual = ".".join(parts[1:])
+                builder._file_functions.setdefault(mod_name, {})[call_node.qualname] = call_node
+        for edge in cached_edges:
+            source = builder._find_node(edge["source"])
+            target = builder._find_node(edge["target"])
+            if source is None or target is None:
+                continue
+            builder.graph.add_edge(
+                source, target, over_approx=bool(edge.get("over_approx", False))
+            )
+
+        # Dependency module-level code runs on import -> entry point.
+        for pkg in dep_packages:
+            dep_module_node = CallNode(qualname=f"{pkg}.<module>", file="", line=1)
             if dep_module_node not in builder.entry_points:
                 builder.entry_points.append(dep_module_node)
-            # Dynamic sites are still detected from dependency source files so
-            # that cached graphs never hide a dynamic blocker (soundness).
-            dynamic_sites = _detect_dynamic_in_dependency(dependency_name)
-        else:
-            graph_result = builder.build(dependency_name=dependency_name)
-            call_graph = graph_result
-            dynamic_sites = graph_result.dynamic_sites
-            # Cache the dependency subgraph for reuse across projects.
-            dep_nodes, dep_edges = _extract_dependency_subgraph(
-                graph_result.graph, dependency_name
-            )
-            cache.put(
-                dependency_name,
-                dependency_version,
-                "callgraph",
-                CacheStore.serialize_graph(dep_nodes, dep_edges),
-            )
-    else:
-        call_graph = builder.build()
-        dynamic_sites = call_graph.dynamic_sites
 
-    if call_graph is None:
-        # Construct from builder state after cached-subgraph path.
         call_graph = CallGraphResult(
             graph=builder.graph,
             entry_points=builder.entry_points,
@@ -175,6 +281,9 @@ def _run_pipeline(
             unparsed_files=list(builder.unparsed_files),
             unresolved_calls=list(builder.unresolved_calls),
         )
+    else:
+        call_graph = builder.build()
+        dynamic_sites = call_graph.dynamic_sites
 
     analyzer = ReachabilityAnalyzer(call_graph, project_path)
 
@@ -199,6 +308,12 @@ def _run_pipeline(
             summary = record.get("summary", "") if record else ""
             vuln_funcs = diff_to_funcs.functions_for_commit(fix, summary)
             functions_unknown = diff_to_funcs.functions_unknown
+            # Add public entry points (public functions calling changed private
+            # functions) as additional vulnerable targets -- they are likely user
+            # entry points that reach the vulnerable code.
+            for ep in diff_to_funcs.public_entry_points:
+                if ep not in vuln_funcs:
+                    vuln_funcs.append(ep)
             cache.put(
                 package,
                 version,
@@ -234,32 +349,6 @@ def _run_pipeline(
     return verdicts, fix_commits, call_graph
 
 
-def _extract_dependency_subgraph(graph, dependency_name: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Extract nodes/edges whose module starts with the dependency name."""
-    nodes: list[dict[str, Any]] = []
-    edges: list[dict[str, Any]] = []
-    dep_prefix = dependency_name + "."
-    for node in graph.nodes:
-        if node.qualname == f"{dependency_name}.<module>" or node.qualname.startswith(dep_prefix):
-            nodes.append({"qualname": node.qualname, "file": node.file, "line": node.line})
-    for source, target, data in graph.edges(data=True):
-        if (
-            source.qualname == f"{dependency_name}.<module>"
-            or source.qualname.startswith(dep_prefix)
-        ) and (
-            target.qualname == f"{dependency_name}.<module>"
-            or target.qualname.startswith(dep_prefix)
-        ):
-            edges.append(
-                {
-                    "source": source.qualname,
-                    "target": target.qualname,
-                    "over_approx": bool(data.get("over_approx", False)),
-                }
-            )
-    return nodes, edges
-
-
 def _detect_dynamic_in_dependency(dependency_name: str) -> list:
     """Detect dynamic sites in an installed dependency's source files.
 
@@ -276,11 +365,7 @@ def _detect_dynamic_in_dependency(dependency_name: str) -> list:
     except Exception:
         base = None
     if base is None or not base.is_dir():
-        try:
-            mod = __import__(dependency_name)
-            base = Path(getattr(mod, "__file__", "") or "").parent
-        except Exception:
-            return []
+        return []
     sites: list = []
     for py in sorted(base.rglob("*.py")):
         if any(part in {".git", "__pycache__", "tests", "test"} for part in py.parts):
@@ -377,12 +462,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.isolated:
             from vulnreach.sandbox.docker_runner import DockerRunner
 
+            runner = DockerRunner()
             try:
-                runner = DockerRunner()
                 report = runner.run_isolated(project_path, args.alerts, args.out_dir)
             except RuntimeError as exc:
-                # Isolation failures are user-facing configuration/runtime
-                # errors, not crashes: report them and exit non-zero.
                 print(f"error: isolated analysis failed: {exc}", file=sys.stderr)
                 return 1
             verdicts = [Verdict.model_validate(v) for v in report.get("verdicts", [])]
@@ -393,7 +476,9 @@ def main(argv: list[str] | None = None) -> int:
 
         alerts = load_alerts(args.alerts)
         cache = CacheStore(enabled=not args.no_cache)
-        verdicts, fix_commits, _call_graph = _run_pipeline(project_path, alerts, cache)
+        verdicts, fix_commits, _call_graph = _run_pipeline(
+            project_path, alerts, cache, cache_enabled=not args.no_cache
+        )
 
         # Write outputs
         out_dir: Path = args.out_dir

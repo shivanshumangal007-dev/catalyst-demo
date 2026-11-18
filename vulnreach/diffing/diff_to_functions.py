@@ -30,7 +30,7 @@ from vulnreach.models import VulnerableFunction
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 COMMIT_DIFF_RE = re.compile(r"github.com/([^/]+)/([^/]+?)(?:\.git)?/commit/([0-9a-fA-F]{5,40})")
-MODULE_RE = re.compile(r"github.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
+MODULE_RE = re.compile(r"^https?://github.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
 
 # File name / path signals that a change should be ignored entirely.
 IGNORED_DIRS = {

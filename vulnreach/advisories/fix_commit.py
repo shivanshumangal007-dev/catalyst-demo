@@ -3,11 +3,11 @@
 Resolution order (first match wins):
 
 1. ``direct_link`` (confidence 0.95): a GIT range event ``fixed`` value, or a
-   reference of type ``FIX``, that contains ``/commit/<sha>``.
+   reference of type ``FIX``/``WEB``/``ADVISORY`` that contains ``/commit/<sha>``.
 2. ``pr_reference`` (confidence 0.70): a reference pointing at a GitHub pull
    request or issue; the merge commit is resolved via the GitHub API.
 3. ``tag_diff`` (confidence 0.50): compare the git tags of the last-vulnerable
-   and first-fixed releases.
+   and first-fixed releases using :mod:`packaging.version`.
 4. ``not_found``: return ``None`` sha.
 
 An optional ``GITHUB_TOKEN`` env var is used for GitHub API calls. All HTTP
@@ -28,19 +28,26 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from packaging.version import Version, InvalidVersion
+
 from vulnreach.models import FixCommit
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 COMMIT_URL_RE = re.compile(r"/commit/([0-9a-fA-F]{5,40})")
 BARE_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
-GITHUB_URL_RE = re.compile(r"^https://github.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/.*)?$")
+GITHUB_URL_RE = re.compile(r"^https?://github.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)(?:/.*)?$")
+PACKAGE_REF_RE = re.compile(r"github.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
+
+# Reference types that may carry a direct commit URL.
+DIRECT_REF_TYPES = {"FIX", "WEB", "ADVISORY"}
 
 
 class FixCommitResolver:
     """Resolve the fix commit for an OSV advisory record."""
 
-    def __init__(self, cache_db: str | Path | None = None) -> None:
+    def __init__(self, cache_db: str | Path | None = None, enabled: bool = True) -> None:
         self.cache_db = Path(cache_db) if cache_db else Path.home() / ".cache" / "vulnreach" / "fixcommit.sqlite"
+        self.enabled = enabled
         self.cache_db.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
@@ -80,7 +87,7 @@ class FixCommitResolver:
 
         for aff in affected:
             if repo_url is None:
-                repo_url = aff.get("package", {}).get("repository")
+                repo_url = self._repo_url_from_affected(aff)
             for rng in aff.get("ranges") or []:
                 if rng.get("type") != "GIT":
                     continue
@@ -95,18 +102,20 @@ class FixCommitResolver:
                             confidence=0.95,
                         )
 
-        # Any reference of type FIX containing /commit/<sha>.
+        # Any reference of type FIX / WEB / ADVISORY containing /commit/<sha>.
         for ref in record.get("references") or []:
-            if ref.get("type") == "FIX":
-                url = ref.get("url") or ""
-                m = COMMIT_URL_RE.search(url)
-                if m:
-                    return FixCommit(
-                        repo_url=self._github_repo_url(url) or repo_url,
-                        sha=m.group(1),
-                        resolution_method="direct_link",
-                        confidence=0.95,
-                    )
+            ref_type = ref.get("type", "").upper()
+            if ref_type not in DIRECT_REF_TYPES:
+                continue
+            url = ref.get("url") or ""
+            m = COMMIT_URL_RE.search(url)
+            if m:
+                return FixCommit(
+                    repo_url=self._github_repo_url(url) or repo_url,
+                    sha=m.group(1),
+                    resolution_method="direct_link",
+                    confidence=0.95,
+                )
         return None
 
     @staticmethod
@@ -118,6 +127,21 @@ class FixCommitResolver:
             return m.group(1)
         if BARE_SHA_RE.match(fixed):
             return fixed
+        return None
+
+    @staticmethod
+    def _repo_url_from_affected(aff: dict[str, Any]) -> str | None:
+        """Extract repo URL from an affected entry, including PACKAGE refs."""
+        repo = aff.get("package", {}).get("repository")
+        if repo:
+            return repo
+        # PACKAGE reference URL (e.g. GitHub repository of the package).
+        for ref in aff.get("references") or []:
+            if ref.get("type", "").upper() == "PACKAGE":
+                url = ref.get("url") or ""
+                m = PACKAGE_REF_RE.search(url)
+                if m:
+                    return f"https://github.com/{m.group(1)}/{m.group(2)}"
         return None
 
     # ------------------------------------------------------------------ method 2: PR / issue reference
@@ -181,7 +205,7 @@ class FixCommitResolver:
 
         for aff in affected:
             if repo_url is None:
-                repo_url = aff.get("package", {}).get("repository")
+                repo_url = self._repo_url_from_affected(aff)
             for rng in aff.get("ranges") or []:
                 if rng.get("type") != "ECOSYSTEM":
                     continue
@@ -189,9 +213,9 @@ class FixCommitResolver:
                     introduced = event.get("introduced")
                     fixed = event.get("fixed")
                     if isinstance(introduced, str):
-                        last_vuln = introduced if last_vuln is None else max(last_vuln, introduced)
+                        last_vuln = self._max_version(last_vuln, introduced)
                     if isinstance(fixed, str):
-                        first_fixed = fixed if first_fixed is None else min(first_fixed, fixed)
+                        first_fixed = self._min_version(first_fixed, fixed)
 
         if not (repo_url and last_vuln and first_fixed):
             return None
@@ -206,8 +230,39 @@ class FixCommitResolver:
             confidence=0.5,
         )
 
+    @staticmethod
+    def _parse_version(v: str) -> Version | None:
+        try:
+            return Version(v)
+        except InvalidVersion:
+            return None
+
+    @classmethod
+    def _max_version(cls, current: str | None, candidate: str) -> str:
+        if current is None:
+            return candidate
+        cur = cls._parse_version(current)
+        cand = cls._parse_version(candidate)
+        if cur is None or cand is None:
+            return max(current, candidate)
+        return candidate if cand > cur else current
+
+    @classmethod
+    def _min_version(cls, current: str | None, candidate: str) -> str:
+        if current is None:
+            return candidate
+        cur = cls._parse_version(current)
+        cand = cls._parse_version(candidate)
+        if cur is None or cand is None:
+            return min(current, candidate)
+        return candidate if cand < cur else current
+
     def _git_tag_diff_commit(self, repo_url: str, last_vuln: str, first_fixed: str) -> str | None:
-        """Shallow-clone the repo and return the commit the first-fixed tag points to."""
+        """Fetch tags and return the commit the first-fixed tag points to.
+
+        Uses ``--no-tags`` then explicitly fetches the tags we need so a shallow
+        clone still resolves tag refs.
+        """
         try:
             with tempfile.TemporaryDirectory() as td:
                 clone = subprocess.run(
@@ -217,18 +272,16 @@ class FixCommitResolver:
                 )
                 if clone.returncode != 0:
                     return None
-                tags = subprocess.run(
-                    ["git", "tag", "-l"],
-                    capture_output=True,
-                    text=True,
-                    cwd=td,
-                    timeout=30,
-                )
-                if tags.returncode != 0:
-                    return None
-                tag_list = [t for t in tags.stdout.split() if t in {last_vuln, first_fixed}]
-                if first_fixed not in tag_list:
-                    return None
+                # Fetch the specific tags we need (shallow clone may not include them).
+                for tag in {last_vuln, first_fixed}:
+                    fetch = subprocess.run(
+                        ["git", "fetch", "--depth", "1", "--quiet", "--tags", repo_url, f"{tag}:{tag}"],
+                        capture_output=True,
+                        cwd=td,
+                        timeout=60,
+                    )
+                    if fetch.returncode != 0:
+                        return None
                 rev = subprocess.run(
                     ["git", "rev-list", "-n", "1", first_fixed],
                     capture_output=True,
@@ -270,6 +323,8 @@ class FixCommitResolver:
             return None
 
     def _read_cache(self, key: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
         try:
             with sqlite3.connect(self.cache_db) as conn:
                 row = conn.execute(
@@ -282,6 +337,8 @@ class FixCommitResolver:
             return None
 
     def _write_cache(self, key: str, data: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
         try:
             with sqlite3.connect(self.cache_db) as conn:
                 conn.execute(
@@ -295,7 +352,7 @@ class FixCommitResolver:
     def _repo_url_from_record(record: dict[str, Any]) -> str | None:
         affected = record.get("affected") or []
         for aff in affected:
-            repo = aff.get("package", {}).get("repository")
+            repo = FixCommitResolver._repo_url_from_affected(aff)
             if repo:
                 return repo
         return None

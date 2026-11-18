@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 from pathlib import Path
 
@@ -46,3 +47,134 @@ def test_no_cache_bypasses_store(tmp_path):
     store = CacheStore(enabled=False)
     verdicts, _, _ = _run_pipeline(project, alerts, store)
     assert verdicts[0].status == "uncertain"
+
+
+# ------------------------------------------------------------------ F-06: cold/warm cache equivalence
+
+
+def test_cold_and_warm_cache_agree(tmp_path, monkeypatch):
+    """Cold and warm cache runs must produce identical verdicts (F-06)."""
+    # Set up a dependency package with a vulnerable function.
+    dep = tmp_path / "mydep"
+    (dep / "__init__.py").parent.mkdir(parents=True)
+    (dep / "__init__.py").write_text("")
+    (dep / "core.py").write_text("def vulnerable():\n    return 1\n")
+    (dep / "api.py").write_text("from .core import vulnerable\ndef public():\n    return vulnerable()\n")
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "main.py").write_text("from mydep.api import public\npublic()\n")
+
+    alerts = [
+        {"package": "mydep", "version": "1.0.0", "advisory_id": "ADV-1"},
+    ]
+
+    class FakeDist:
+        def locate_file(self, rel):
+            return dep / rel
+
+    monkeypatch.setattr(
+        "importlib.metadata.distribution", lambda name: FakeDist()
+        if name == "mydep"
+        else (_ for _ in ()).throw(
+            importlib.metadata.PackageNotFoundError(name)
+        ),
+    )
+
+    cache_db = tmp_path / "cache.sqlite"
+
+    # Cold run.
+    store_cold = CacheStore(db_path=cache_db)
+    verdicts_cold, _, _ = _run_pipeline(project, alerts, store_cold)
+
+    # Warm run with the same cache db.
+    store_warm = CacheStore(db_path=cache_db)
+    verdicts_warm, _, _ = _run_pipeline(project, alerts, store_warm)
+
+    # Verdicts must be identical.
+    assert [v.status for v in verdicts_cold] == [v.status for v in verdicts_warm]
+    assert [v.confidence for v in verdicts_cold] == [
+        v.confidence for v in verdicts_warm
+    ]
+
+
+# ------------------------------------------------------------------ F-15: multi-alert packages all in graph
+
+
+def test_multi_alert_all_packages_in_graph(tmp_path, monkeypatch):
+    """Every alert package must be in the call graph, not just the first."""
+    # Set up two dependency packages, each with a vulnerable function.
+    for pkg_name in ("depa", "depb"):
+        p = tmp_path / pkg_name
+        p.mkdir(parents=True)
+        (p / "__init__.py").write_text("")
+        (p / "core.py").write_text(f"def {pkg_name}_vuln():\n    return 1\n")
+        (p / "api.py").write_text(
+            f"from .core import {pkg_name}_vuln\ndef public():\n    return {pkg_name}_vuln()\n"
+        )
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "main.py").write_text(
+        "from depa.api import public as a\nfrom depb.api import public as b\na()\nb()\n"
+    )
+
+    alerts = [
+        {"package": "depa", "version": "1.0.0", "advisory_id": "ADV-depa"},
+        {"package": "depb", "version": "1.0.0", "advisory_id": "ADV-depb"},
+    ]
+
+    class FakeDist:
+        def __init__(self, base):
+            self.base = base
+
+        def locate_file(self, rel):
+            return self.base / rel
+
+    dists = {"depa": FakeDist(tmp_path / "depa"), "depb": FakeDist(tmp_path / "depb")}
+
+    def fake_dist(name):
+        if name in dists:
+            return dists[name]
+        import importlib.metadata
+
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr("importlib.metadata.distribution", fake_dist)
+
+    # Pre-populate the cache with advisory functions so functions_unknown=False.
+    cache_db = tmp_path / "cache.sqlite"
+    store = CacheStore(db_path=cache_db)
+    FIX_COMMIT = {
+        "repo_url": "https://github.com/example/dep",
+        "sha": "a" * 40,
+        "resolution_method": "direct_link",
+        "confidence": 0.95,
+    }
+    for pkg_name in ("depa", "depb"):
+        store.put(
+            pkg_name,
+            "1.0.0",
+            "advisory_functions",
+            {
+                "fix_commit": FIX_COMMIT,
+                "vulnerable_functions": [
+                    {
+                        "module": f"{pkg_name}.core",
+                        "qualified_name": f"{pkg_name}.core.{pkg_name}_vuln",
+                        "file_path": f"{pkg_name}/core.py",
+                        "confidence": 0.95,
+                    }
+                ],
+                "functions_unknown": False,
+            },
+            advisory_id=f"ADV-{pkg_name}",
+        )
+
+    verdicts, _, call_graph = _run_pipeline(project, alerts, store)
+
+    # Both packages must appear in the graph.
+    all_qualnames = {n.qualname for n in call_graph.graph.nodes}
+    assert any("depa." in q for q in all_qualnames), "depa missing from graph"
+    assert any("depb." in q for q in all_qualnames), "depb missing from graph"
+
+    # Both verdicts must be reachable (both packages are called).
+    assert [v.status for v in verdicts] == ["reachable", "reachable"]
