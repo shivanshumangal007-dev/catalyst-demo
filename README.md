@@ -5,7 +5,12 @@ project and its vulnerability alerts (advisories for pinned dependencies),
 VulnReach decides for each alert whether the vulnerable code can actually be
 reached from the project's code.
 
-## Verdicts
+## Problem
+
+Not every vulnerability alert affects your project. An advisory may flag a
+package you depend on, but if the vulnerable function is never called from your
+code, the alert is noise. VulnReach answers the question: *can the vulnerable
+code be reached from my project?* It outputs one verdict per alert:
 
 | Verdict   | Meaning                                                              | OpenVEX status   |
 |-----------|----------------------------------------------------------------------|------------------|
@@ -14,11 +19,36 @@ reached from the project's code.
 | uncertain | Dynamic Python features could hide a path                            | `under_investigation` |
 
 Per the project's hard rule, VulnReach never emits `not_reachable` when
-reachability cannot be ruled out — when in doubt, it reports `uncertain`.
+reachability cannot be ruled out — when in doubt, it reports `uncertain`.  A
+false "safe" is the worst possible failure.
 
 Every verdict carries evidence (the call path with `file:line` per hop), a
 confidence level (`high`/`medium`/`low`) with a reason, and a human-readable
 explanation.
+
+## Architecture (text diagram)
+
+```
+ alerts.json                                  OpenVEX document
+   |                                              ^
+   v                                              |
++---------+     +----------------+     +----------------+     +----------+
+|  CLI    | --> | Fix-commit     | --> | Call graph     | --> | Analyzer |
+|  scan   |     | resolution     |     | builder (ast)  |     | (reach)  |
++---------+     +----------------+     +----------------+     +----------+
+   |              (OSV client)    |  project + dep     |  entry pts --> vuln fns
+   |                              |  over-approx edges   |  dynamic sites
+   v                              +----------------+     |
++---------+                       |                |     v
+| Cache   | <---------------------+ report.json    | +-----------+
+| (sqlite)|     advisory -> vuln fn  | report.vex.json| | PR Chat   |
++---------+     call graph JSON   |    (OpenVEX)   | | Agent     |
+                                  +----------------+     +-----------+
+                                                                   |
+                                                                   v
+                                                          FastAPI app (app.py)
+                                                          /chat, /verdicts, UI
+```
 
 ## Pipeline
 
@@ -37,6 +67,8 @@ explanation.
    `pkgutil`), `**kwargs` dispatch, dict-of-callables, unsafe `pickle`/`yaml`
    — downgrade to `uncertain` when they could hide a path.
 7. **Emit** — `report.json` and an OpenVEX v0.2.0 document (`report.vex.json`).
+8. **PR chat agent + FastAPI UI** — debate a verdict on a PR, quote `file:line`
+   evidence, record user assumptions.
 
 ## Installation
 
@@ -66,6 +98,53 @@ Exit code `1` if any verdict is `reachable` (suitable for CI).
 [
   { "package": "requests", "version": "2.25.0", "advisory_id": "GHSA-cc3m-4wpp-2x39", "aliases": ["CVE-2020-26137"] }
 ]
+```
+
+## PR chat agent & FastAPI UI
+
+The agent (`vulnreach/agent/pr_chat.py`) debates a verdict using only evidence
+from the report. It quotes `file:line` hops from the call path, never claims
+certainty it does not have, and can re-run the analyzer when a user challenges
+a `not_reachable` verdict or supplies new information (recorded as a
+user-asserted assumption).
+
+### Rule-based fallback (no LLM)
+
+A built-in `RuleBasedLLMClient` works without any model endpoint, for demos
+and offline use:
+
+```python
+from vulnreach.agent.pr_chat import PRChatAgent, RuleBasedLLMClient, build_pr_comment
+
+agent = PRChatAgent(verdict, analyzer, project_path, alert,
+                    vuln_funcs, fix_commit, call_graph)
+print(agent.respond("Is lib.vulnerable_function reachable?"))
+print(build_pr_comment(agent.verdict))
+```
+
+### Pluggable LLM
+
+Implement `LLMClient.chat(messages)` to wire up your own model endpoint.
+
+### FastAPI app
+
+```bash
+pip install fastapi uvicorn
+uvicorn app:app --reload
+```
+
+* `GET /verdicts` — list stored verdicts
+* `POST /chat` — `{verdict_id, message}` → agent reply
+* `GET /` — minimal single-page HTML chat UI
+
+## Demo
+
+A scripted PR scenario with three verdicts (reachable, not_reachable, uncertain)
+and a conversation showing the agent changing its answer after the user supplies
+new information:
+
+```bash
+PYTHONPATH=. python demo/run_conversation.py
 ```
 
 ## Caching
@@ -119,6 +198,63 @@ Docker must be installed on the host.
 pytest
 ```
 
+## Design answers
+
+### (a) Fix commit → vulnerable functions and confidence
+
+The fix commit is resolved from the OSV record in priority order:
+`direct_link` (0.95) → `pr_reference` via GitHub API (0.70) → `tag_diff`
+comparing last-vulnerable/first-fixed release tags (0.50) → `not_found`.
+The diff is parsed with `unidiff`; changed lines are mapped to enclosing
+functions/methods via `ast` on the pre-fix file. Qualified names include the
+module path and class (e.g. `yaml.constructor.FullConstructor.construct_python_object`).
+Confidence starts at the commit resolution confidence, loses 0.1 for a private
+function changed only by formatting-looking lines, and gains 0.05 if the
+function name appears in the advisory text. If no fix commit is found,
+`functions_unknown=True` and the analyzer must emit `uncertain`, never
+`not_reachable`.
+
+### (b) Handling dynamic Python honestly
+
+Dynamic features are detected per-file (getattr/setattr with non-literal
+names, importlib/`__import__` non-literal, eval/exec, entry_points /
+pkg_resources / pkgutil plugin loading, `globals()[name]()`, `**kwargs`
+forwarding, dict-of-callables dispatch, unsafe pickle/yaml). They are recorded
+as `DynamicSite` objects with file:line. The analyzer downgrades to
+`uncertain` whenever any dynamic site exists in reachable code — it never
+emits `not_reachable` when reachability cannot be ruled out. The PR chat agent
+likewise never claims certainty: it says "uncertain" when dynamic features
+block proof, and records user assumptions (e.g. "getattr only ever receives
+'safe_load'") as caveats on the verdict.
+
+### (c) Caching strategy
+
+Two caches keyed by `package@version`, both with hash-based invalidation that
+incorporates the analyzer version:
+
+* **advisory_functions**: fix commit + vulnerable functions per advisory
+* **callgraph**: the dependency's internal call graph as JSON
+
+On a hit, the cached result is reused (popular packages analyzed once,
+reused across projects). On a miss, the full pipeline runs and the result is
+stored. Cache hits are logged. `--no-cache` disables the store entirely.
+
+## Known limitations
+
+* **Static only**: VulnReach does not execute code. Runtime code generation,
+  heavily dynamic dispatch, or native extensions may hide paths that static
+  analysis cannot see (correctly reported as `uncertain`).
+* **Dependency resolution**: installed dependency sources are located via
+  `importlib.metadata`; editable installs or namespace packages may not be
+  found.
+* **GitHub API**: PR/issue resolution requires network and may need
+  `GITHUB_TOKEN` for higher rate limits.
+* **Over-approximation**: unresolved calls add edges to all functions with a
+  matching name, which can produce false positives (reachable when it's not).
+  These edges are flagged and downgrade confidence to `medium`.
+* **Single vulnerable package**: the CLI's cached dependency call graph is
+  keyed on the first alert's package; multi-package projects re-run per alert.
+
 ## Project layout
 
 ```
@@ -132,8 +268,14 @@ vulnreach/
   cache/              # SQLite cache store
   sandbox/            # isolated Docker runner
   vex/                # OpenVEX document generation
+  agent/              # PR conversation agent
 tests/
   fixtures/           # synthetic apps (reachable / indirect / not_reachable / dynamic)
+demo/
+  fixtures/           # demo apps (reachable / not_reachable / dynamic)
+  pr_scenario.py      # three-verdict demo scenario
+  run_conversation.py # scripted PR chat conversation
+app.py                # FastAPI app (/chat, /verdicts, UI)
 Dockerfile
 pyproject.toml
 README.md
