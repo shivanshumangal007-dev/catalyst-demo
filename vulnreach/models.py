@@ -60,3 +60,4 @@ class Verdict(BaseModel):
     call_path: list[PathHop] = Field(default_factory=list)
     reasons: list[str] = Field(default_factory=list)
     dynamic_blockers: list[str] = Field(default_factory=list)
+    explanation: str = ""
