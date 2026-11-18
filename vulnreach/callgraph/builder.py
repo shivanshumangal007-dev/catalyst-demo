@@ -44,6 +44,13 @@ class CallGraphResult:
     entry_points: list[CallNode]
     dynamic_sites: list[DynamicSite]
     name_index: dict[str, list[CallNode]]
+    # Files that could not be read or parsed.  Any non-empty entry means the
+    # graph is incomplete, so the analyzer must not return ``not_reachable``.
+    unparsed_files: list[str] = field(default_factory=list)
+    # Call sites (inside the analysed project) whose callee could not be
+    # resolved and whose receiver is the target dependency.  Such a call could
+    # reach a vulnerable dependency function that is absent from the graph.
+    unresolved_calls: list[str] = field(default_factory=list)
 
 
 # A local name binding recorded during the import/definition pass.
@@ -87,6 +94,10 @@ class CallGraphBuilder:
         self._current_module: str = ""
         self._current_class: str | None = None
         self._current_caller: CallNode | None = None
+        # Soundness bookkeeping (see CallGraphResult)
+        self.unparsed_files: list[str] = []
+        self.unresolved_calls: list[str] = []
+        self._dependency_name: str | None = None
 
     # ------------------------------------------------------------------ cached subgraph
 
@@ -129,6 +140,7 @@ class CallGraphBuilder:
         include_dependency: bool = True,
     ) -> CallGraphResult:
         self._reset()
+        self._dependency_name = dependency_name if include_dependency else None
         files = self._collect_project_files()
         if dependency_name and include_dependency:
             files.extend(self._collect_dependency_files(dependency_name))
@@ -157,6 +169,8 @@ class CallGraphBuilder:
             entry_points=self.entry_points,
             dynamic_sites=dynamic_sites,
             name_index=self._name_index,
+            unparsed_files=list(self.unparsed_files),
+            unresolved_calls=list(self.unresolved_calls),
         )
 
     # ------------------------------------------------------------------ reset / files
@@ -172,6 +186,9 @@ class CallGraphBuilder:
         self._instance_types = {}
         self._name_index = {}
         self._framework_functions = set()
+        self.unparsed_files = []
+        self.unresolved_calls = []
+        self._dependency_name = None
 
     def _collect_project_files(self) -> list[tuple[str, Path]]:
         files: list[tuple[str, Path]] = []
@@ -224,14 +241,24 @@ class CallGraphBuilder:
         return ".".join(parts)
 
     def _parse_file(self, path: Path) -> ast.Module | None:
+        """Parse one file, recording any failure as an incomplete graph.
+
+        A file we cannot read or parse could contain the only call path to the
+        vulnerable function, so it must make the whole analysis ``uncertain``.
+        """
         try:
             source = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            self._record_unparsed(path, exc)
             return None
         try:
             return ast.parse(source, filename=str(path))
-        except SyntaxError:
+        except (SyntaxError, ValueError, RecursionError) as exc:
+            self._record_unparsed(path, exc)
             return None
+
+    def _record_unparsed(self, path: Path, exc: BaseException) -> None:
+        self.unparsed_files.append(f"{self._display_file(path)} ({type(exc).__name__})")
 
     # ------------------------------------------------------------------ pass 1: definitions
 
@@ -497,10 +524,45 @@ class CallGraphBuilder:
         if caller is None:
             return
         callees, over_approx = self._resolve_call_targets(module, call.func)
+        if not callees and self._call_targets_dependency(module, call.func):
+            # This call is aimed at the vulnerable dependency but we could not
+            # map it to any graph node.  It could therefore reach a vulnerable
+            # function we never indexed; record it so the analyzer stays
+            # ``uncertain`` instead of declaring the package safe.
+            try:
+                rendered = ast.unparse(call.func)
+            except Exception:
+                rendered = "<unprintable>"
+            self.unresolved_calls.append(
+                f"{self._display_file(self._path_for_module(module))}:{call.lineno} "
+                f"unresolved call to {rendered}"
+            )
         for callee in callees:
             if callee is caller:
                 continue
             self.graph.add_edge(caller, callee, over_approx=over_approx)
+
+    def _call_targets_dependency(self, module: str, func_expr: ast.AST) -> bool:
+        """Return True when a call's receiver is imported from the dependency."""
+        dependency = self._dependency_name
+        if not dependency:
+            return False
+        root = self._root_name(func_expr)
+        if root is None:
+            return False
+        binding = self._file_imports.get(module, {}).get(root)
+        if binding is None:
+            return False
+        target = binding.qualname or binding.module or ""
+        return target == dependency or target.startswith(dependency + ".")
+
+    @staticmethod
+    def _root_name(func_expr: ast.AST) -> str | None:
+        if isinstance(func_expr, ast.Name):
+            return func_expr.id
+        if isinstance(func_expr, ast.Attribute):
+            return CallGraphBuilder._root_name(func_expr.value)
+        return None
 
     def _resolve_call_targets(self, module: str, func_expr: ast.AST) -> tuple[list[CallNode], bool]:
         """Return (possible callees, whether resolution was over-approximated)."""

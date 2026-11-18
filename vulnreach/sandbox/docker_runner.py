@@ -100,7 +100,6 @@ class DockerRunner:
             "-w",
             self.container_workdir,
             self.image,
-            "vulnreach",
             "scan",
             container_project,
             "--alerts",

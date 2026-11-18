@@ -172,6 +172,8 @@ def _run_pipeline(
             entry_points=builder.entry_points,
             dynamic_sites=dynamic_sites,
             name_index=builder._name_index,
+            unparsed_files=list(builder.unparsed_files),
+            unresolved_calls=list(builder.unresolved_calls),
         )
 
     analyzer = ReachabilityAnalyzer(call_graph, project_path)
@@ -375,8 +377,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.isolated:
             from vulnreach.sandbox.docker_runner import DockerRunner
 
-            runner = DockerRunner()
-            report = runner.run_isolated(project_path, args.alerts, args.out_dir)
+            try:
+                runner = DockerRunner()
+                report = runner.run_isolated(project_path, args.alerts, args.out_dir)
+            except RuntimeError as exc:
+                # Isolation failures are user-facing configuration/runtime
+                # errors, not crashes: report them and exit non-zero.
+                print(f"error: isolated analysis failed: {exc}", file=sys.stderr)
+                return 1
             verdicts = [Verdict.model_validate(v) for v in report.get("verdicts", [])]
             _print_table(verdicts, args.only_uncertain)
             if any(v.status == "reachable" for v in verdicts):

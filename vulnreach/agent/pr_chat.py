@@ -423,47 +423,45 @@ class PRChatAgent:
         )
 
     def _handle_assumption(self, assumption: UserAssumption) -> str:
-        """Re-run analysis under the user's assumption and state the dependency."""
-        # Re-run: if the assumption addresses the only dynamic blocker, we may
-        # move from uncertain to not_reachable — but only with the caveat.
+        """Record a user assertion as a visible caveat; never change the status.
+
+        A user's assertion is not evidence: it cannot remove a dynamic blocker
+        or turn ``uncertain`` into ``not_reachable``.  The assumption is stored
+        in the conversation and appended to the verdict's reasons/explanation
+        so the caveat is visible to every consumer of the report.
+        """
         v = self.verdict
-        still_blockers = [
-            s for s in self.analyzer.dynamic_sites
-            if assumption.related_dynamic_site and str(s) != assumption.related_dynamic_site
-        ] or ([] if assumption.related_dynamic_site else list(self.analyzer.dynamic_sites))
+        caveat = f"User assertion (not evidence): {assumption.assumption}"
+        reasons = list(v.reasons)
+        if caveat not in reasons:
+            reasons.append(caveat)
 
-        if v.status == "uncertain" and not still_blockers and not v.call_path:
-            # The assumption removes the only blocker and there's no static path.
-            self.verdict = Verdict(
-                alert=self.alert,
-                status="not_reachable",
-                confidence="medium",
-                call_path=[],
-                reasons=[
-                    "No static call path",
-                    f"Verdict depends on user assumption: {assumption.assumption}",
-                ],
-                dynamic_blockers=[],
-                explanation=(
-                    f"Not reachable: no static path, and the only dynamic blocker is "
-                    f"addressed by the user assumption “{assumption.assumption}”. "
-                    f"This verdict depends on that assumption being true."
-                ),
-            )
-            return (
-                f"Under your assumption (“{assumption.assumption}”), the only dynamic "
-                f"blocker is addressed and there is no static call path. I have updated "
-                f"the verdict to **not_reachable**, but **this depends on your "
-                f"assumption being true** — if it is not, the verdict reverts to "
-                f"uncertain."
-            )
-
-        return (
-            f"I have recorded your assumption: “{assumption.assumption}”. "
-            f"The current verdict ({v.status}) now **depends on this assumption**. "
-            f"If the assumption does not hold, dynamic features could still conceal a "
-            f"path to the vulnerable code, and the verdict would be uncertain."
+        explanation = v.explanation
+        caveat_note = (
+            f"Caveat: the user asserted “{assumption.assumption}”. This is not "
+            f"verified evidence and was not used to change the verdict; the "
+            f"verdict remains {v.status}."
         )
+        if caveat_note not in explanation:
+            explanation = f"{explanation}\n\n{caveat_note}" if explanation else caveat_note
+
+        self.verdict = v.model_copy(
+            deep=True,
+            update={"reasons": reasons, "explanation": explanation},
+        )
+
+        reply = (
+            f"I have recorded your assumption: “{assumption.assumption}”. "
+            f"It is a user-supplied caveat, not evidence; the verdict depends "
+            f"only on the analysis, so the assertion does not change it. The "
+            f"verdict remains **{v.status}** (confidence {v.confidence})."
+        )
+        if v.status == "uncertain":
+            reply += (
+                " Dynamic features could still conceal a path to the vulnerable "
+                "code; treat this as needing manual review."
+            )
+        return reply
 
     # ------------------------------------------------------------------ helpers
 

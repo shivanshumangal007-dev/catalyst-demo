@@ -11,6 +11,8 @@ Pass 1.
 
 Totals: **17 P0, 17 P1, 11 P2, 6 P3** (51 findings). The P0 list is `P0-1` …
 `P0-17`; the findings table adds cross-references `F-01` … `F-51`.
+Round 1 (safety net) fixed **F-02, F-03, F-10, F-14, F-16, F-39, F-51**; see
+section 14 for the fix log and regression coverage.
 
 ---
 
@@ -270,59 +272,59 @@ broken. The README's isolation section, `--isolated` help text, and
 
 ## 2. Findings table (severity, location, repro, fix)
 
-| ID | Sev | file:line | Problem | Repro | Exact fix |
-|----|-----|-----------|---------|-------|-----------|
-| F-01 | P0 | callgraph/builder.py:401-480 | Only `Expr(Call)`/`Return(Call)` create edges; all other expression contexts dropped | `python3 audit_work/probe_calls.py` | Walk every `ast.Call` with a generic visitor; attribute caller/current function by lexical scope; add over-approx edge when unresolved |
-| F-02 | P0 | reachability/analyzer.py:70-78,139-159 | Missing target node → `not_reachable` | `python3 audit_work/probe_core.py` | If `target_nodes` is empty (or fewer than expected), return `uncertain` with a "target not found in graph" reason |
-| F-03 | P0 | diffing/diff_to_functions.py:193-246 | Added-only hunks ignored | `python3 audit_work/probe_diff.py` | Map added lines too; if only additions, use enclosing function of the added line; if none, mark `functions_unknown=True` |
-| F-04 | P0 | diffing/diff_to_functions.py:33,407 | `MODULE_RE` lacks `^https://` | `python3 -c` `_repo_parts('https://github.com/psf/requests') is None` | Anchor with `^https?://` and percent-decode; add regression test using real URL |
-| F-05 | P0 | callgraph/builder.py:189-217 | site-packages walked under dependency prefix | `_collect_dependency_files('networkx')` | Resolve the actual top-level package dir (`dist.locate_file(pkg_path)` / `top_level.txt` / `dist.files`) |
-| F-06 | P0 | callgraph/builder.py:93-123; cli.py:133-175 | Cached dep edges dropped; project→dep edges added before cache | `audit_work/probe_core.py` cache section | Add cached nodes to `_file_functions`, and rebuild project edges after `add_cached_subgraph`; or store/restore the entire merged graph |
-| F-07 | P0 | callgraph/builder.py:433,473 | `ExceptHandler` not iterable | any `try/except` fixture | Iterate `handler.body` for each `ExceptHandler` |
-| F-08 | P0 | dynamic_detector.py:88-98 + builder.py:505-512 | Literal getattr not resolved | `probe_calls.py` | Resolve `getattr(obj, "name")` to a call to `obj.name` by rewriting the callee expression / adding edge |
-| F-09 | P0 | dynamic_detector.py:101-136,154-163 | entry_points/subclasses/registries/aliases missed | `probe_calls.py`, `probe_core.py` | Detect `Name`/`Attribute` forms, `__subclasses__`, any `Subscript` call on a name, and decorator registration |
-| F-10 | P0 | builder.py:226-234; diffing:181-184 | Syntax error silently skipped; non-UTF-8 crashes | `probe_core.py` | Set an `unparseable_files` flag → force `uncertain` for any alert; catch `UnicodeDecodeError`, `ValueError`, `RecursionError` and flag |
-| F-11 | P0 | builder.py:617-647 | Missing entry points | `probe_core.py` | Library mode: all public module functions; parse setup.py with AST (no execution); broaden decorator prefixes/registration |
-| F-12 | P0 | builder.py:219-224; diffing:421-430 | `src/` names differ | `probe_core.py` | Canonicalize modules by detecting `src/`/package roots on both sides; compare by file path + short qualname too |
-| F-13 | P0 | builder.py:256-269 | Relative import target drops submodule/alias | `probe_imports.py` | For level>0, target = resolved package + `node.module` + alias.name; resolve aliases through the name index by original target |
-| F-14 | P0 | agent/pr_chat.py:430-459 | User assumption flips uncertain→not_reachable | Phase 6 | Keep `uncertain`; record assumption as an explicit caveat; only change status when verified evidence is supplied |
-| F-15 | P0 | cli.py:123-166 | Only first alert's package in graph | `audit_work/probe_pipeline.py` | Build one graph per distinct package or a single graph including all alert packages |
-| F-16 | P0 | analyzer.py:139-159 | Ignores per-function confidence | fixture with 0.4-confidence vf | If any target has confidence below a threshold, return `uncertain`; never `high` if extraction is weak |
-| F-17 | P1 | OpenVEX: openvex.py:49-90 | `vulnerability` is a string, `products` are strings, top-level `subcomponents` | `python3 audit_work/probe_vex.py` | Use `{"vulnerability":{"name":...}}`, `products:[{"@id":purl}]`, nest subcomponents under the product |
-| F-18 | P1 | openvex.py:25-31 | Justification set wrong (`inline_protections_already_in_place`, `other`; missing `component_not_present`, `inline_mitigations_already_exist`) | same | Use exactly the five spec labels |
-| F-19 | P1 | openvex.py:34-37 | No PEP 503 purl normalization | `PyYAML` → `pkg:pypi/PyYAML` | Lowercase and normalize `[-_.]+` to `-` |
-| F-20 | P1 | fix_commit.py:98-110 | Only `FIX` refs accepted; OSV commit URLs are frequently `WEB` | live OSV run below | Accept `WEB`/`ADVISORY` commit URLs when they point at `/commit/<sha>` |
-| F-21 | P1 | fix_commit.py:76-110,175-207 | Repo URL only read from `affected[].package.repository`; OSV usually has a `PACKAGE` reference | live run: pyyaml/urllib3/jinja2 all `not_found` | Fall back to PACKAGE references / PACKAGE_URL |
-| F-22 | P1 | fix_commit.py:192-194 | Lexicographic version max/min; `introduced` used as last vulnerable | read | Use `packaging.version`; derive vulnerable range correctly |
-| F-23 | P1 | fix_commit.py:209-244 | Shallow clone with `--depth 1` likely fetches no tags; no tag diff produced | read | Fetch tags, use `git diff <last_vuln> <first_fixed>`, or use GitHub compare API |
-| F-24 | P1 | cache/store.py:74-79; cli.py | `--no-cache` does not disable OSV/GitHub HTTP caches; callgraph keyed by first alert only | read | Separate cache namespaces; include all packages; honor disable flag |
-| F-25 | P1 | callgraph/builder.py:201-207; cli.py:276-281 | Fallback `__import__(dependency)` executes dependency code on host | read | Remove fallback or run it only inside Docker; use `importlib.metadata.files` |
-| F-26 | P1 | sandbox/docker_runner.py:113-123 | Container exit 1 on reachable is treated as failure | read | Accept exit code 1 as success and parse the report |
-| F-27 | P1 | Dockerfile:4,13-21 | Base image not digest-pinned; project requirements never installed | read | Pin `python:3.11-slim@sha256:...`; build per-project image installing `--only-binary :all:` pinned deps |
-| F-28 | P1 | Dockerfile:18 / .dockerignore absent | Build context copies `.git`, potential `.env`/secrets into image | read | Add `.dockerignore`; copy only needed files |
-| F-29 | P1 | tests/test_docker_runner.py:24-63 | Test mocks `subprocess.run`, never verifies real isolation | read | Add a real Docker smoke test (behind a marker) |
-| F-30 | P1 | agent/pr_chat.py:148,154-181 | `llm_client` is stored but never called; pluggable LLM is dead code | grep `llm_client` | Call `self.llm_client.chat(...)` with evidence-only system prompt, or remove the claim |
-| F-31 | P1 | agent/pr_chat.py:316-338 | Challenge needs function-like name; a bare filename does not re-run; `_find_target_node` accepts unrelated targets | Phase 6 | Accept `file:line`/file-only by resolving any node in that file; restrict target search to vulnerable functions or user-named graph nodes with an explicit note |
-| F-32 | P1 | diffing/diff_to_functions.py:340-393 | `public_entry_points` computed but never used by the pipeline | grep `public_entry_points` | Feed these as additional vulnerable targets (public API) or use them to raise confidence |
-| F-33 | P1 | cli.py:194-199 | Advisory resolution is synchronous network in CLI; no timeout/parallelism; 20s each | read | Parallelize with bounded concurrency; expose offline mode |
-| F-34 | P2 | vex/openvex.py:121 | `@id` random UUID each run → non-reproducible document | read | Derive a deterministic UUID from content + version |
-| F-35 | P2 | openvex.py:40-41 | Timestamp second precision, fine; but no `last_updated`/`tooling` | read | Add optional `tooling`; keep ISO-8601 UTC |
-| F-36 | P2 | cache/store.py:96-146 | No WAL/busy_timeout; malformed graph values can KeyError | `probe_cache.py` | `PRAGMA journal_mode=WAL`, validate schema/types, catch KeyError |
-| F-37 | P2 | builder.py:555-584 | Base class lookup mixes short names and full qualnames; methods resolved by over-approx | read | Normalize class qualnames and MRO |
-| F-38 | P2 | builder.py:270-271,326-327 | Module-level `if`/`try` blocks not traversed for definitions/imports | read | Recursively collect definitions in `If`, `Try`, `With`, `Match` bodies |
-| F-39 | P2 | analyzer.py:163-181 | Target lookup falls back to qualname-only across files/modules | read | Require exact file+qualname; if absent → uncertain |
-| F-40 | P2 | PathHop line evidence uses definition lines only; dep paths absolute | read + exec | Record call-site lines while walking; relativize dependency paths |
-| F-41 | P2 | demo/pr_scenario.py:80-167 | Demo hardcodes verdicts/call paths; qualname `app_reachable.main.<module>` does not exist in the graph | `python demo/run_conversation.py` | Derive verdicts by calling the analyzer; keep hand-written text out of evidence |
-| F-42 | P2 | app.py:232-235 | `seed_demo_verdicts` is a no-op; app starts with zero verdicts; no upload/ingest endpoint | read | Load a report.json or scan on startup; expose a documented seeding path |
-| F-43 | P2 | tests/test_fix_commit.py | No tests for WEB commit refs, PACKAGE repo refs, 404/rate limits, tag diff, real URL parsing | read | Add the missing tests; assert `functions_for_commit` end-to-end with a mocked raw URL |
-| F-44 | P2 | tests/test_reachability.py | Tests bypass `diff_to_functions`/CLI; fixture set covers only direct/indirect/getattr | read | Extend to the Phase 7 fixture table |
-| F-45 | P3 | cli.py:382-384 | Isolated exit code logic unreachable because runner raises first | read | Return report + exit status separately |
-| F-46 | P3 | cli.py:357-384 | `--no-cache` does not propagate into HTTP caches (same as F-24) | read | Pass a `NetworkCache(enabled=...)` |
-| F-47 | P3 | models.py / analyzer.py | `list` untyped, `status: str` with `type: ignore`; not "full type hints" | read | Use `list[VulnerableFunction]`, `Literal` status type in helper signature |
-| F-48 | P3 | app.py | No auth/rate limiting on `/chat`; unbounded message length | read | Add length limit; bind to localhost by default |
-| F-49 | P3 | pyproject.toml | No `[project.optional-dependencies]` for `fastapi`/`uvicorn`; README says `pip install fastapi uvicorn` manually | read | Declare an `app` extra |
-| F-50 | P3 | README.md:152-161,165-181 | Claims isolation installs project dependencies and that cached call graphs are reused; neither is true (F-27, F-06) | read + exec | Fix code or correct docs |
-| F-51 | P0 | Dockerfile:27; sandbox/docker_runner.py:103-110 | `ENTRYPOINT ["vulnreach"]` plus argv `"vulnreach"` → `vulnreach vulnreach scan`; `--isolated` always exits 2 | `python3 -m vulnreach.cli scan … --isolated` | Remove the duplicated `"vulnreach"` from `run_cmd` (or add `--entrypoint`); add a real-Docker smoke test |
+| ID | Sev | file:line | Problem | Repro | Exact fix | Status |
+|----|-----|-----------|---------|-------|-----------|--------|
+| F-01 | P0 | callgraph/builder.py:401-480 | Only `Expr(Call)`/`Return(Call)` create edges; all other expression contexts dropped | `python3 audit_work/probe_calls.py` | Walk every `ast.Call` with a generic visitor; attribute caller/current function by lexical scope; add over-approx edge when unresolved | Open |
+| F-02 | P0 | reachability/analyzer.py:70-78,139-159 | Missing target node → `not_reachable` | `python3 audit_work/probe_core.py` | If `target_nodes` is empty (or fewer than expected), return `uncertain` with a "target not found in graph" reason | **Fixed (Round 1)** |
+| F-03 | P0 | diffing/diff_to_functions.py:193-246 | Added-only hunks ignored | `python3 audit_work/probe_diff.py` | Map added lines too; if only additions, use enclosing function of the added line; if none, mark `functions_unknown=True` | **Fixed (Round 1)** |
+| F-04 | P0 | diffing/diff_to_functions.py:33,407 | `MODULE_RE` lacks `^https://` | `python3 -c` `_repo_parts('https://github.com/psf/requests') is None` | Anchor with `^https?://` and percent-decode; add regression test using real URL | Open |
+| F-05 | P0 | callgraph/builder.py:189-217 | site-packages walked under dependency prefix | `_collect_dependency_files('networkx')` | Resolve the actual top-level package dir (`dist.locate_file(pkg_path)` / `top_level.txt` / `dist.files`) | Open |
+| F-06 | P0 | callgraph/builder.py:93-123; cli.py:133-175 | Cached dep edges dropped; project→dep edges added before cache | `audit_work/probe_core.py` cache section | Add cached nodes to `_file_functions`, and rebuild project edges after `add_cached_subgraph`; or store/restore the entire merged graph | Open |
+| F-07 | P0 | callgraph/builder.py:433,473 | `ExceptHandler` not iterable | any `try/except` fixture | Iterate `handler.body` for each `ExceptHandler` | Open |
+| F-08 | P0 | dynamic_detector.py:88-98 + builder.py:505-512 | Literal getattr not resolved | `probe_calls.py` | Resolve `getattr(obj, "name")` to a call to `obj.name` by rewriting the callee expression / adding edge | Open |
+| F-09 | P0 | dynamic_detector.py:101-136,154-163 | entry_points/subclasses/registries/aliases missed | `probe_calls.py`, `probe_core.py` | Detect `Name`/`Attribute` forms, `__subclasses__`, any `Subscript` call on a name, and decorator registration | Open |
+| F-10 | P0 | builder.py:226-234; diffing:181-184 | Syntax error silently skipped; non-UTF-8 crashes | `probe_core.py` | Set an `unparseable_files` flag → force `uncertain` for any alert; catch `UnicodeDecodeError`, `ValueError`, `RecursionError` and flag | **Fixed (Round 1)** |
+| F-11 | P0 | builder.py:617-647 | Missing entry points | `probe_core.py` | Library mode: all public module functions; parse setup.py with AST (no execution); broaden decorator prefixes/registration | Open |
+| F-12 | P0 | builder.py:219-224; diffing:421-430 | `src/` names differ | `probe_core.py` | Canonicalize modules by detecting `src/`/package roots on both sides; compare by file path + short qualname too | Open |
+| F-13 | P0 | builder.py:256-269 | Relative import target drops submodule/alias | `probe_imports.py` | For level>0, target = resolved package + `node.module` + alias.name; resolve aliases through the name index by original target | Open |
+| F-14 | P0 | agent/pr_chat.py:430-459 | User assumption flips uncertain→not_reachable | Phase 6 | Keep `uncertain`; record assumption as an explicit caveat; only change status when verified evidence is supplied | **Fixed (Round 1)** |
+| F-15 | P0 | cli.py:123-166 | Only first alert's package in graph | `audit_work/probe_pipeline.py` | Build one graph per distinct package or a single graph including all alert packages | Open |
+| F-16 | P0 | analyzer.py:139-159 | Ignores per-function confidence | fixture with 0.4-confidence vf | If any target has confidence below a threshold, return `uncertain`; never `high` if extraction is weak | **Fixed (Round 1)** |
+| F-17 | P1 | OpenVEX: openvex.py:49-90 | `vulnerability` is a string, `products` are strings, top-level `subcomponents` | `python3 audit_work/probe_vex.py` | Use `{"vulnerability":{"name":...}}`, `products:[{"@id":purl}]`, nest subcomponents under the product | Open |
+| F-18 | P1 | openvex.py:25-31 | Justification set wrong (`inline_protections_already_in_place`, `other`; missing `component_not_present`, `inline_mitigations_already_exist`) | same | Use exactly the five spec labels | Open |
+| F-19 | P1 | openvex.py:34-37 | No PEP 503 purl normalization | `PyYAML` → `pkg:pypi/PyYAML` | Lowercase and normalize `[-_.]+` to `-` | Open |
+| F-20 | P1 | fix_commit.py:98-110 | Only `FIX` refs accepted; OSV commit URLs are frequently `WEB` | live OSV run below | Accept `WEB`/`ADVISORY` commit URLs when they point at `/commit/<sha>` | Open |
+| F-21 | P1 | fix_commit.py:76-110,175-207 | Repo URL only read from `affected[].package.repository`; OSV usually has a `PACKAGE` reference | live run: pyyaml/urllib3/jinja2 all `not_found` | Fall back to PACKAGE references / PACKAGE_URL | Open |
+| F-22 | P1 | fix_commit.py:192-194 | Lexicographic version max/min; `introduced` used as last vulnerable | read | Use `packaging.version`; derive vulnerable range correctly | Open |
+| F-23 | P1 | fix_commit.py:209-244 | Shallow clone with `--depth 1` likely fetches no tags; no tag diff produced | read | Fetch tags, use `git diff <last_vuln> <first_fixed>`, or use GitHub compare API | Open |
+| F-24 | P1 | cache/store.py:74-79; cli.py | `--no-cache` does not disable OSV/GitHub HTTP caches; callgraph keyed by first alert only | read | Separate cache namespaces; include all packages; honor disable flag | Open |
+| F-25 | P1 | callgraph/builder.py:201-207; cli.py:276-281 | Fallback `__import__(dependency)` executes dependency code on host | read | Remove fallback or run it only inside Docker; use `importlib.metadata.files` | Open |
+| F-26 | P1 | sandbox/docker_runner.py:113-123 | Container exit 1 on reachable is treated as failure | read | Accept exit code 1 as success and parse the report | Open |
+| F-27 | P1 | Dockerfile:4,13-21 | Base image not digest-pinned; project requirements never installed | read | Pin `python:3.11-slim@sha256:...`; build per-project image installing `--only-binary :all:` pinned deps | Open |
+| F-28 | P1 | Dockerfile:18 / .dockerignore absent | Build context copies `.git`, potential `.env`/secrets into image | read | Add `.dockerignore`; copy only needed files | Open |
+| F-29 | P1 | tests/test_docker_runner.py:24-63 | Test mocks `subprocess.run`, never verifies real isolation | read | Add a real Docker smoke test (behind a marker) | Open |
+| F-30 | P1 | agent/pr_chat.py:148,154-181 | `llm_client` is stored but never called; pluggable LLM is dead code | grep `llm_client` | Call `self.llm_client.chat(...)` with evidence-only system prompt, or remove the claim | Open |
+| F-31 | P1 | agent/pr_chat.py:316-338 | Challenge needs function-like name; a bare filename does not re-run; `_find_target_node` accepts unrelated targets | Phase 6 | Accept `file:line`/file-only by resolving any node in that file; restrict target search to vulnerable functions or user-named graph nodes with an explicit note | Open |
+| F-32 | P1 | diffing/diff_to_functions.py:340-393 | `public_entry_points` computed but never used by the pipeline | grep `public_entry_points` | Feed these as additional vulnerable targets (public API) or use them to raise confidence | Open |
+| F-33 | P1 | cli.py:194-199 | Advisory resolution is synchronous network in CLI; no timeout/parallelism; 20s each | read | Parallelize with bounded concurrency; expose offline mode | Open |
+| F-34 | P2 | vex/openvex.py:121 | `@id` random UUID each run → non-reproducible document | read | Derive a deterministic UUID from content + version | Open |
+| F-35 | P2 | openvex.py:40-41 | Timestamp second precision, fine; but no `last_updated`/`tooling` | read | Add optional `tooling`; keep ISO-8601 UTC | Open |
+| F-36 | P2 | cache/store.py:96-146 | No WAL/busy_timeout; malformed graph values can KeyError | `probe_cache.py` | `PRAGMA journal_mode=WAL`, validate schema/types, catch KeyError | Open |
+| F-37 | P2 | builder.py:555-584 | Base class lookup mixes short names and full qualnames; methods resolved by over-approx | read | Normalize class qualnames and MRO | Open |
+| F-38 | P2 | builder.py:270-271,326-327 | Module-level `if`/`try` blocks not traversed for definitions/imports | read | Recursively collect definitions in `If`, `Try`, `With`, `Match` bodies | Open |
+| F-39 | P2 | analyzer.py:163-181 | Target lookup falls back to qualname-only across files/modules | read | Require exact file+qualname; if absent → uncertain | **Fixed (Round 1)** |
+| F-40 | P2 | PathHop line evidence uses definition lines only; dep paths absolute | read + exec | Record call-site lines while walking; relativize dependency paths | Open |
+| F-41 | P2 | demo/pr_scenario.py:80-167 | Demo hardcodes verdicts/call paths; qualname `app_reachable.main.<module>` does not exist in the graph | `python demo/run_conversation.py` | Derive verdicts by calling the analyzer; keep hand-written text out of evidence | Open |
+| F-42 | P2 | app.py:232-235 | `seed_demo_verdicts` is a no-op; app starts with zero verdicts; no upload/ingest endpoint | read | Load a report.json or scan on startup; expose a documented seeding path | Open |
+| F-43 | P2 | tests/test_fix_commit.py | No tests for WEB commit refs, PACKAGE repo refs, 404/rate limits, tag diff, real URL parsing | read | Add the missing tests; assert `functions_for_commit` end-to-end with a mocked raw URL | Open |
+| F-44 | P2 | tests/test_reachability.py | Tests bypass `diff_to_functions`/CLI; fixture set covers only direct/indirect/getattr | read | Extend to the Phase 7 fixture table | Open |
+| F-45 | P3 | cli.py:382-384 | Isolated exit code logic unreachable because runner raises first | read | Return report + exit status separately | Open |
+| F-46 | P3 | cli.py:357-384 | `--no-cache` does not propagate into HTTP caches (same as F-24) | read | Pass a `NetworkCache(enabled=...)` | Open |
+| F-47 | P3 | models.py / analyzer.py | `list` untyped, `status: str` with `type: ignore`; not "full type hints" | read | Use `list[VulnerableFunction]`, `Literal` status type in helper signature | Open |
+| F-48 | P3 | app.py | No auth/rate limiting on `/chat`; unbounded message length | read | Add length limit; bind to localhost by default | Open |
+| F-49 | P3 | pyproject.toml | No `[project.optional-dependencies]` for `fastapi`/`uvicorn`; README says `pip install fastapi uvicorn` manually | read | Declare an `app` extra | Open |
+| F-50 | P3 | README.md:152-161,165-181 | Claims isolation installs project dependencies and that cached call graphs are reused; neither is true (F-27, F-06) | read + exec | Fix code or correct docs | Open |
+| F-51 | P0 | Dockerfile:27; sandbox/docker_runner.py:103-110 | `ENTRYPOINT ["vulnreach"]` plus argv `"vulnreach"` → `vulnreach vulnreach scan`; `--isolated` always exits 2 | `python3 -m vulnreach.cli scan … --isolated` | Remove the duplicated `"vulnreach"` from `run_cmd` (or add `--entrypoint`); add a real-Docker smoke test | **Fixed (Round 1)** |
 
 ---
 
@@ -741,6 +743,53 @@ not met.
     nodes; add message-length limits; and either wire `llm_client` with
     evidence-only sanitization or remove the pluggable-LLM claim (P0-14, F-30,
     F-31, F-48).
+
+---
+
+## 14. Fix rounds
+
+### Round 1 — safety net (complete)
+
+Findings fixed: **F-02, F-03, F-10, F-14, F-16, F-39, F-51**.
+
+Regression suite: `tests/test_safety_net.py` (11 tests). All 11 failed on the
+pre-fix commit (`d5538e6`) and all pass after Round 1. Full suite after the
+round: **63 passed**.
+
+What changed:
+
+* `reachability/analyzer.py` now has an explicit **positive-evidence gate**.
+  `not_reachable` is emitted only when: the vulnerable-function list is
+  non-empty and `functions_unknown` is false; every target maps to exactly one
+  node by qualname **and** file (the qualname-only fallback is gone); no file
+  failed to parse; no dynamic site exists; and no unresolved call targets the
+  dependency. Any violation returns `uncertain` with the failed precondition in
+  `reasons`. Per-function confidence below `0.7` also forces `uncertain`.
+* `callgraph/builder.py` records `unparsed_files` (syntax errors, non-UTF-8,
+  other read/parse failures) and `unresolved_calls` (call sites whose receiver
+  is the target dependency but whose callee is absent from the graph), and
+  exposes both on `CallGraphResult`.
+* `diffing/diff_to_functions.py` maps **added** lines to the enclosing pre-fix
+  function by anchoring them to the nearest old-file line; a changed Python
+  file that cannot be inspected, or a diff that yields no function at all, sets
+  `functions_unknown=True`.
+* `agent/pr_chat.py` treats a user assertion as a visible caveat only. It never
+  changes the verdict or removes dynamic blockers; `uncertain` always stays
+  `uncertain`.
+* `sandbox/docker_runner.py` no longer duplicates the `vulnreach` entrypoint in
+  the container argv (`ENTRYPOINT` already supplies it), and `cli.py` catches
+  `RuntimeError`, prints `error: isolated analysis failed: …`, and exits 1
+  instead of showing a traceback.
+
+Notes:
+
+* The PASS 1 audit probe asserted `uncertain` for an added-only hunk. After
+  F-03 the enclosing vulnerable function is identified and reachable from the
+  project, so the safe contract is `status != "not_reachable"`; the new
+  regression test asserts that contract. The historical probe under
+  `audit_work/` is left unchanged as PASS 1 evidence.
+* The F-51 unit test mocks Docker and asserts the exact argv; the real-container
+  isolation evidence remains `audit_work/probe_docker.py`.
 
 ---
 
