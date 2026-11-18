@@ -1,0 +1,1 @@
+"""OpenVEX output for VulnReach."""
