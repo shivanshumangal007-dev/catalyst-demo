@@ -99,6 +99,7 @@ class _CallVisitor(ast.NodeVisitor):
         self.path = path
         self.caller_stack: list[CallNode | None] = [initial_caller]
         self._current_class: str | None = None
+        self._func_stack: list[str] = []
         self.accounted_calls: set[tuple[str, int]] = set()
         self.all_call_sites: list[tuple[str, int, str]] = []
 
@@ -231,9 +232,30 @@ class _CallVisitor(ast.NodeVisitor):
             elif isinstance(dec, ast.Call):
                 # @deco(args) -- visit the factory call
                 self.visit_Call(dec)
-        self._push_function_scope(node)
+        self._func_stack.append(node.name)
+        self._push_function_scope(node, tuple(self._func_stack[:-1]))
         self.generic_visit(node)
         self.caller_stack.pop()
+        self._func_stack.pop()
+
+    def _push_function_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef, outer: tuple[str, ...] = ()) -> None:
+        qualname = self.builder._function_qualname(self.module, node, self._current_class, outer)
+        new_caller = self.builder._file_functions[self.module].get(qualname)
+        self.caller_stack.append(new_caller if new_caller else None)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        # Process decorators for async functions too
+        caller = self.caller_stack[-1] if self.caller_stack else None
+        for dec in node.decorator_list:
+            if isinstance(dec, ast.Name):
+                self._add_decorator_edge(caller, dec.id)
+            elif isinstance(dec, ast.Call):
+                self.visit_Call(dec)
+        self._func_stack.append(node.name)
+        self._push_function_scope(node, tuple(self._func_stack[:-1]))
+        self.generic_visit(node)
+        self.caller_stack.pop()
+        self._func_stack.pop()
 
     def _add_decorator_edge(self, caller: CallNode | None, dec_name: str) -> None:
         """Add an edge from ``caller`` to the function named ``dec_name``.
@@ -250,18 +272,6 @@ class _CallVisitor(ast.NodeVisitor):
             if callee is not caller:
                 self.builder.graph.add_edge(caller, callee, over_approx=False)
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        # Process decorators for async functions too
-        caller = self.caller_stack[-1] if self.caller_stack else None
-        for dec in node.decorator_list:
-            if isinstance(dec, ast.Name):
-                self._add_decorator_edge(caller, dec.id)
-            elif isinstance(dec, ast.Call):
-                self.visit_Call(dec)
-        self._push_function_scope(node)
-        self.generic_visit(node)
-        self.caller_stack.pop()
-
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         # Class-body statements run in the enclosing scope (module or outer
         # function), so reuse that caller for class-body calls.
@@ -272,6 +282,38 @@ class _CallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
         self.caller_stack.pop()
         self._current_class = prev_class
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        # Comparisons between class instances may invoke dunder methods
+        # (__eq__, __ne__, ...).  Model them as over-approximated edges so a
+        # vulnerable __eq__ is not silently reported not_reachable.
+        caller = self.caller_stack[-1] if self.caller_stack else None
+        if caller is not None:
+            for operand in [node.left] + list(node.comparators):
+                if isinstance(operand, ast.Call):
+                    class_qual = self.builder._class_from_call_func(self.module, operand.func)
+                    if class_qual:
+                        methods = self.builder._class_methods.get(class_qual, {})
+                        for dunder in (
+                            "__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__",
+                        ):
+                            method = methods.get(dunder)
+                            if method is not None and method is not caller:
+                                self.builder.graph.add_edge(caller, method, over_approx=True)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        # Reading a property/method on a fresh instance ``ClassName().attr``
+        # invokes that attribute's getter.  Model it as an edge so a vulnerable
+        # property is not silently reported not_reachable.
+        caller = self.caller_stack[-1] if self.caller_stack else None
+        if caller is not None and isinstance(node.value, ast.Call):
+            class_qual = self.builder._class_from_call_func(self.module, node.value.func)
+            if class_qual:
+                method = self.builder._class_methods.get(class_qual, {}).get(node.attr)
+                if method is not None and method is not caller:
+                    self.builder.graph.add_edge(caller, method, over_approx=True)
+        self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.builder._track_value_assignment(self.module, node)
@@ -285,11 +327,6 @@ class _CallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     # ------------------------------------------------------------------ helpers
-
-    def _push_function_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        qualname = self.builder._function_qualname(self.module, node, self._current_class)
-        new_caller = self.builder._file_functions[self.module].get(qualname)
-        self.caller_stack.append(new_caller if new_caller else None)
 
     @staticmethod
     def _render(expr: ast.AST) -> str:
@@ -324,6 +361,7 @@ class CallGraphBuilder:
         self._file_functions: dict[str, dict[str, CallNode]] = {}
         self._class_bases: dict[str, list[str]] = {}
         self._class_methods: dict[str, dict[str, CallNode]] = {}
+        self._class_nodes: dict[str, CallNode] = {}
         self._instance_types: dict[str, dict[str, str]] = {}
         # Global index: short name -> all CallNodes (for over-approximation)
         self._name_index: dict[str, list[CallNode]] = {}
@@ -375,6 +413,14 @@ class CallGraphBuilder:
             self._name_index.setdefault(call_node.qualname.split(".")[-1], []).append(
                 call_node
             )
+            # Register in _file_functions so _find_node / _resolve_name_call can
+            # locate cached dependency nodes precisely.  Without this, every
+            # cached dependency edge is silently dropped (cold vs warm verdict
+            # mismatch, F-06).
+            parts = call_node.qualname.split(".")
+            if len(parts) > 1:
+                mod_name = parts[0]
+                self._file_functions.setdefault(mod_name, {})[call_node.qualname] = call_node
         for edge in edges:
             source = self._find_node(edge["source"])
             target = self._find_node(edge["target"])
@@ -467,6 +513,7 @@ class CallGraphBuilder:
         self._file_functions = {}
         self._class_bases = {}
         self._class_methods = {}
+        self._class_nodes = {}
         self._instance_types = {}
         self._name_index = {}
         self._framework_functions = set()
@@ -650,11 +697,22 @@ class CallGraphBuilder:
             self._collect_assign(module, node)
 
     def _collect_function(
-        self, module: str, node: ast.FunctionDef | ast.AsyncFunctionDef, class_qualname: str | None
+        self,
+        module: str,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        class_qualname: str | None,
+        outer: tuple[str, ...] = (),
     ) -> str:
+        """Collect one function definition.
+
+        ``outer`` holds the enclosing function names so nested functions keep
+        their full qualified name (e.g. ``lib.outer.inner`` rather than the
+        flattened ``lib.inner``), matching how diff_to_functions names them.
+        """
         parts = [module]
         if class_qualname:
             parts.append(class_qualname.split(".")[-1])
+        parts.extend(outer)
         parts.append(node.name)
         qualname = ".".join(parts)
 
@@ -673,20 +731,24 @@ class CallGraphBuilder:
         if class_qualname:
             self._class_methods.setdefault(class_qualname, {})[node.name] = call_node
 
-        # Recurse into body for nested functions / classes / calls
+        # Recurse into body for nested functions / classes / calls, tracking
+        # this function as an enclosing scope for any nested definitions.
         prev_class = self._current_class
         prev_caller = self._current_caller
         self._current_class = class_qualname
         self._current_caller = call_node
+        new_outer = outer + (node.name,)
         for stmt in node.body:
-            self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+            self._collect_stmt_recursive_in_func(module, stmt, class_qualname, new_outer)
         self._current_class = prev_class
         self._current_caller = prev_caller
         return qualname
 
-    def _collect_stmt_in_func(self, module: str, node: ast.AST, class_qualname: str | None) -> None:
+    def _collect_stmt_in_func(
+        self, module: str, node: ast.AST, class_qualname: str | None, outer: tuple[str, ...] = ()
+    ) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            self._collect_function(module, node, class_qualname)
+            self._collect_function(module, node, class_qualname, outer)
         elif isinstance(node, ast.ClassDef):
             self._collect_class(module, node)
         elif isinstance(node, ast.Import):
@@ -715,32 +777,36 @@ class CallGraphBuilder:
             self._collect_assign(module, node)
 
     def _collect_stmt_recursive_in_func(
-        self, module: str, node: ast.AST, class_qualname: str | None
+        self,
+        module: str,
+        node: ast.AST,
+        class_qualname: str | None,
+        outer: tuple[str, ...] = (),
     ) -> None:
         """Collect definitions in function bodies, recursing into compound blocks."""
-        self._collect_stmt_in_func(module, node, class_qualname)
+        self._collect_stmt_in_func(module, node, class_qualname, outer)
         if isinstance(node, ast.If):
             for stmt in node.body + node.orelse:
-                self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
         elif isinstance(node, ast.Try):
             for stmt in node.body + node.orelse + node.finalbody:
-                self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
             for handler in node.handlers:
                 for stmt in handler.body:
-                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
         elif isinstance(node, ast.TryStar):
             for stmt in node.body + node.orelse + node.finalbody:
-                self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
             for handler in node.handlers:
                 for stmt in handler.body:
-                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
         elif isinstance(node, ast.With):
             for stmt in node.body:
-                self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
         elif isinstance(node, ast.Match):
             for case in node.cases:
                 for stmt in case.body:
-                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
 
     def _collect_class(self, module: str, node: ast.ClassDef) -> None:
         bases = []
@@ -750,12 +816,24 @@ class CallGraphBuilder:
         self._class_bases[class_qualname] = [b for b in bases if b]
         self._class_methods.setdefault(class_qualname, {})
 
+        # Register the class itself as a node so ``ClassName()`` constructor
+        # calls can resolve to ``ClassName.__init__``, and so short-name lookup
+        # can find the class for over-approximation.
+        class_node = CallNode(
+            qualname=class_qualname,
+            file=self._display_file(self._path_for_module(module)),
+            line=node.lineno,
+        )
+        self.graph.add_node(class_node)
+        self._class_nodes[class_qualname] = class_node
+        self._name_index.setdefault(node.name, []).append(class_node)
+
         prev_class = self._current_class
         prev_caller = self._current_caller
         self._current_class = class_qualname
         self._current_caller = None  # class body itself is not a caller
         for stmt in node.body:
-            self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+            self._collect_stmt_recursive_in_func(module, stmt, class_qualname, ())
         self._current_class = prev_class
         self._current_caller = prev_caller
 
@@ -1002,6 +1080,31 @@ class CallGraphBuilder:
                 return self._resolve_attribute_call(module, fake_attr)
         return [], True
 
+    def _class_init_node(self, class_qualname: str) -> CallNode | None:
+        """Return the ``__init__`` method node for a class, if it defines one."""
+        return self._class_methods.get(class_qualname, {}).get("__init__")
+
+    def _class_from_call_func(self, module: str, func_expr: ast.AST) -> str | None:
+        """If ``func_expr`` refers to a class, return its qualified name.
+
+        Used to resolve constructor calls ``ClassName()`` and attribute access
+        on a fresh instance ``ClassName().attr`` (properties, dunders, etc.).
+        """
+        if isinstance(func_expr, ast.Name):
+            name = func_expr.id
+            binding = self._file_imports.get(module, {}).get(name)
+            if binding is not None and binding.qualname in self._class_nodes:
+                return binding.qualname
+            for class_qualname in self._class_nodes:
+                if class_qualname.split(".")[-1] == name:
+                    return class_qualname
+            return None
+        if isinstance(func_expr, ast.Attribute):
+            node = self._resolve_attribute_to_node(module, func_expr)
+            if node is not None and node.qualname in self._class_nodes:
+                return node.qualname
+        return None
+
     def _resolve_name_call(self, module: str, name: str) -> tuple[list[CallNode], bool]:
         # Check value bindings: x = lib.vulnerable; x()
         binding = self._value_bindings.get(module, {}).get(name)
@@ -1011,12 +1114,22 @@ class CallGraphBuilder:
         for qualname, node in self._file_functions[module].items():
             if qualname.split(".")[-1] == name:
                 return [node], False
-        # Imported binding pointing at a specific function
+        # Imported binding pointing at a specific function or class constructor.
         import_binding = self._file_imports[module].get(name)
         if import_binding is not None and import_binding.qualname:
+            if import_binding.qualname in self._class_nodes:
+                init = self._class_init_node(import_binding.qualname)
+                if init is not None:
+                    return [init], False
             node = self._find_node(import_binding.qualname)
             if node:
                 return [node], False
+        # Same-module class constructor: Thing() -> Thing.__init__
+        for class_qualname in self._class_nodes:
+            if class_qualname.split(".")[-1] == name:
+                init = self._class_init_node(class_qualname)
+                if init is not None:
+                    return [init], False
         # Over-approximate: all functions with this short name
         return list(self._name_index.get(name, [])), True
 
@@ -1055,7 +1168,13 @@ class CallGraphBuilder:
             return list(self._name_index.get(attr, [])), True
 
         if isinstance(value, ast.Call):
-            # foo().bar() -> over-approximate
+            # foo().bar() -- if foo() constructs a class instance, bar is a
+            # method/property on that instance (e.g. Thing().value, Thing().__eq__).
+            class_qual = self._class_from_call_func(module, value.func)
+            if class_qual:
+                method = self._class_methods.get(class_qual, {}).get(attr)
+                if method is not None:
+                    return [method], False
             return list(self._name_index.get(attr, [])), True
 
         return list(self._name_index.get(attr, [])), True
@@ -1113,10 +1232,17 @@ class CallGraphBuilder:
                 return node.id + "." + ".".join(reversed(parts))
         return ""
 
-    def _function_qualname(self, module: str, node: ast.FunctionDef | ast.AsyncFunctionDef, class_qualname: str | None) -> str:
+    def _function_qualname(
+        self,
+        module: str,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        class_qualname: str | None,
+        outer: tuple[str, ...] = (),
+    ) -> str:
         parts = [module]
         if class_qualname:
             parts.append(class_qualname.split(".")[-1])
+        parts.extend(outer)
         parts.append(node.name)
         return ".".join(parts)
 
@@ -1201,13 +1327,22 @@ class CallGraphBuilder:
         # console_scripts from pyproject.toml / setup.cfg / setup.py
         for entry in self._console_script_entries():
             qualname = entry.get("qualname")
-            path = entry.get("file")
-            line = entry.get("line", 1)
-            if qualname and path:
+            if not qualname:
+                continue
+            # Reuse the graph node (collected during pass 1) so its file/line
+            # match the node actually in the graph; a freshly built CallNode
+            # with a different (e.g. absolute) path would not compare equal to
+            # it and nx would never find a path through it.
+            node = self._find_node(qualname)
+            if node is None:
+                path = entry.get("file")
+                line = entry.get("line", 1)
+                if path is None:
+                    continue
                 node = CallNode(qualname=qualname, file=str(path), line=line)
-                if node.qualname not in seen:
-                    seen.add(node.qualname)
-                    self.entry_points.append(node)
+            if node.qualname not in seen:
+                seen.add(node.qualname)
+                self.entry_points.append(node)
 
         # Library public API: public functions in packages (directories with
         # __init__.py) are entry points, since users of the package can call

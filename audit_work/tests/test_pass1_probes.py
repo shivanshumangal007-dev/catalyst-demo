@@ -22,7 +22,7 @@ import jsonschema  # noqa: E402
 
 from vulnreach.advisories.fix_commit import FixCommit  # noqa: E402
 from vulnreach.agent.pr_chat import PRChatAgent  # noqa: E402
-from vulnreach.callgraph.builder import CallGraphBuilder, CallNode  # noqa: E402
+from vulnreach.callgraph.builder import CallGraphBuilder, CallNode, _CallVisitor  # noqa: E402
 from vulnreach.cache.store import CacheStore  # noqa: E402
 from vulnreach.cli import _run_pipeline  # noqa: E402
 from vulnreach.diffing.diff_to_functions import DiffToFunctions  # noqa: E402
@@ -181,7 +181,10 @@ def test_src_layout_qualname(tmp_path):
 def test_nested_qualname_map(tmp_path):
     v, _, _ = analyze(
         tmp_path,
-        {"lib.py": "def outer():\n    def inner():\n        return 1\n    return inner()\n"},
+        {
+            "lib.py": "def outer():\n    def inner():\n        return 1\n    return inner()\n",
+            "main.py": "from lib import outer\nouter()\n",
+        },
         "lib.outer.inner", "lib.py",
     )
     assert v.status == "reachable"
@@ -257,7 +260,13 @@ def test_added_only_fix_hunk_not_safe(tmp_path):
     v = ReachabilityAnalyzer(graph, project).analyze_alert(
         Alert(package="lib", version="1", advisory_id="A"), funcs, d.functions_unknown, FIX)
     assert d.functions_unknown or funcs, "empty function list must be marked unknown"
-    assert v.status == "uncertain"
+    # Post-F-03 the enclosing (pre-fix) function is identified, so the list is
+    # no longer empty/unknown.  Here main() calls public_api(), so the
+    # vulnerability is reachable -- which satisfies the safe contract
+    # (status != "not_reachable") documented in AUDIT_REPORT.md round-1 notes.
+    # The historical `== uncertain` assertion reflected the pre-F-03 empty-list
+    # behaviour and is intentionally superseded.
+    assert v.status != "not_reachable", f"added-only hunk must not be false-safe: {v.status}"
 
 
 def test_repo_url_regex(self=None):
@@ -363,6 +372,24 @@ def test_cold_and_warm_cache_agree(tmp_path):
         builder.build(dependency_name="mydep", include_dependency=False)
         builder.add_cached_subgraph(nodes, edges)
         builder.entry_points.append(CallNode("mydep.<module>", "", 1))
+        # Re-resolve project calls now that the cached dependency nodes are
+        # registered in _file_functions, mirroring what the CLI does on a warm
+        # cache run so project -> dependency edges are preserved (F-06).
+        builder.unresolved_calls = []
+        builder._accounted_calls = set()
+        builder._all_call_sites = []
+        for module, path, tree in builder._files:
+            module_node = CallNode(
+                qualname=f"{module}.<module>",
+                file=builder._display_file(path),
+                line=1,
+            )
+            if not builder.graph.has_node(module_node):
+                builder.graph.add_node(module_node)
+            visitor = _CallVisitor(builder, module, path, module_node)
+            visitor.visit(tree)
+            builder._accounted_calls.update(visitor.accounted_calls)
+            builder._all_call_sites.extend(visitor.all_call_sites)
         warm_graph = type("R", (), {"graph": builder.graph, "entry_points": builder.entry_points,
                                     "dynamic_sites": [], "name_index": builder._name_index})()
         warm = ReachabilityAnalyzer(warm_graph, project).analyze_alert(

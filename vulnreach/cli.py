@@ -267,6 +267,29 @@ def _run_pipeline(
                 source, target, over_approx=bool(edge.get("over_approx", False))
             )
 
+        # Re-resolve project calls now that every dependency node (freshly parsed
+        # or restored from cache) is registered in ``_file_functions``.  Without
+        # this, project -> dependency call edges resolved during the project-only
+        # build (before dep nodes existed) are lost on warm cache runs, breaking
+        # cold/warm verdict equivalence (F-06).  Re-visiting also recomputes
+        # ``unresolved_calls`` so a call that was unresolved before the cache was
+        # restored (but is now resolvable) no longer forces ``uncertain``.
+        builder.unresolved_calls = []
+        builder._accounted_calls = set()
+        builder._all_call_sites = []
+        for module, path, tree in builder._files:
+            module_node = CallNode(
+                qualname=f"{module}.<module>",
+                file=builder._display_file(path),
+                line=1,
+            )
+            if not builder.graph.has_node(module_node):
+                builder.graph.add_node(module_node)
+            visitor = _CallVisitor(builder, module, path, module_node)
+            visitor.visit(tree)
+            builder._accounted_calls.update(visitor.accounted_calls)
+            builder._all_call_sites.extend(visitor.all_call_sites)
+
         # Dependency module-level code runs on import -> entry point.
         for pkg in dep_packages:
             dep_module_node = CallNode(qualname=f"{pkg}.<module>", file="", line=1)
