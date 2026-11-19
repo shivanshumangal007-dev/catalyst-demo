@@ -17,6 +17,7 @@ hard rule, we never emit ``not_reachable`` when reachability cannot be ruled out
 from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 import networkx as nx
 
@@ -360,8 +361,8 @@ class ReachabilityAnalyzer:
         self,
         alert: Alert,
         *,
-        status: str,
-        confidence: str,
+        status: Literal["reachable", "not_reachable", "uncertain"],
+        confidence: Literal["high", "medium", "low"],
         call_path: list[PathHop],
         reasons: list[str],
         dynamic_blockers: list[str],
@@ -369,8 +370,8 @@ class ReachabilityAnalyzer:
     ) -> Verdict:
         return Verdict(
             alert=alert,
-            status=status,  # type: ignore[arg-type]
-            confidence=confidence,  # type: ignore[arg-type]
+            status=status,
+            confidence=confidence,
             call_path=call_path,
             reasons=reasons,
             dynamic_blockers=dynamic_blockers,

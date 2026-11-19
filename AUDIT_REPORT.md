@@ -320,7 +320,7 @@ broken. The README's isolation section, `--isolated` help text, and
 | F-44 | P2 | tests/test_reachability.py | Tests bypass `diff_to_functions`/CLI; fixture set covers only direct/indirect/getattr | read | Extend to the Phase 7 fixture table | Open |
 | F-45 | P3 | cli.py:382-384 | Isolated exit code logic unreachable because runner raises first | read | Return report + exit status separately | Open |
 | F-46 | P3 | cli.py:357-384 | `--no-cache` does not propagate into HTTP caches (same as F-24) | read | Pass a `NetworkCache(enabled=...)` | Open |
-| F-47 | P3 | models.py / analyzer.py | `list` untyped, `status: str` with `type: ignore`; not "full type hints" | read | Use `list[VulnerableFunction]`, `Literal` status type in helper signature | Open |
+| F-47 | P3 | models.py / analyzer.py | `list` untyped, `status: str` with `type: ignore`; not "full type hints" | read | Use `list[VulnerableFunction]`, `Literal` status type in helper signature | **Fixed (Round 3)** |
 | F-48 | P3 | app.py | No auth/rate limiting on `/chat`; unbounded message length | read | Add length limit; bind to localhost by default | **Fixed (Round 3)** |
 | F-49 | P3 | pyproject.toml | No `[project.optional-dependencies]` for `fastapi`/`uvicorn`; README says `pip install fastapi uvicorn` manually | read | Declare an `app` extra | Open |
 | F-50 | P3 | README.md:152-161,165-181 | Claims isolation installs project dependencies and that cached call graphs are reused; neither is true (F-27, F-06) | read + exec | Fix code or correct docs | Open |
