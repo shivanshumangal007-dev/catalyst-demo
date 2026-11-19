@@ -85,7 +85,11 @@ def build_pr_comment(verdict: Verdict) -> str:
 # ------------------------------------------------------------------ LLM client
 
 class LLMClient(ABC):
-    """Pluggable LLM interface.  Implement ``chat`` to hook up a model endpoint."""
+    """Pluggable LLM interface.  Implement ``chat`` to hook up a model endpoint.
+
+    The agent passes an evidence-only system prompt plus the user's message.
+    Implementations must not inject any information beyond the report evidence.
+    """
 
     @abstractmethod
     def chat(self, messages: list[dict[str, str]]) -> str:
@@ -145,7 +149,12 @@ class PRChatAgent:
         self.vulnerable_functions = vulnerable_functions
         self.fix_commit = fix_commit
         self.call_graph = call_graph
-        self.llm_client: LLMClient = llm_client or RuleBasedLLMClient(self)
+        if llm_client is None:
+            self.llm_client: LLMClient = RuleBasedLLMClient(self)
+        elif isinstance(llm_client, type):
+            self.llm_client: LLMClient = llm_client(self)
+        else:
+            self.llm_client: LLMClient = llm_client
         self.assumptions: list[UserAssumption] = []
         self.conversation: list[dict[str, str]] = []
 
@@ -159,8 +168,9 @@ class PRChatAgent:
         * User challenges a ``not_reachable`` verdict on a named function/path
           -> re-run the analyzer for that target and update the answer.
         * User supplies new information about a dynamic feature
-          -> record as an assumption, re-run, say the verdict depends on it.
-        * General question -> answer from the verdict's evidence.
+          -> record as an assumption, say the verdict depends on it.
+        * General question -> answer from the verdict's evidence (via LLM client
+          or rule-based fallback).
         """
         self.conversation.append({"role": "user", "content": user_message})
 
@@ -308,23 +318,115 @@ class PRChatAgent:
         return "\n".join(parts)
 
     def _general_reply(self, user_message: str) -> str:
-        """Answer a general question from the verdict evidence only."""
+        """Answer a general question from the verdict evidence only.
+
+        Uses the pluggable LLM client if available, falling back to the
+        rule-based reply.  The LLM is given an evidence-only system prompt so it
+        cannot claim facts outside the report.
+        """
+        # Build the evidence context from the verdict.
+        context = self._build_evidence_context()
+        messages = [
+            {"role": "system", "content": context},
+            {"role": "user", "content": user_message},
+        ]
+
+        # Try the LLM client first; fall back to rule-based on any failure.
+        try:
+            llm_reply = self.llm_client.chat(messages)
+            if llm_reply and llm_reply.strip():
+                return llm_reply.strip()
+        except Exception:
+            pass
         return self._rule_based_reply(user_message)
+
+    def _build_evidence_context(self) -> str:
+        """Build an evidence-only context string for the LLM client."""
+        v = self.verdict
+        lines: list[str] = []
+        lines.append("You are VulnReach, a reachability-based vulnerability triage agent.")
+        lines.append("Answer ONLY from the evidence below. Do not invent facts.")
+        lines.append("")
+        lines.append(f"Package: {v.alert.package}@{v.alert.version}")
+        lines.append(f"Advisory: {v.alert.advisory_id}")
+        if v.alert.aliases:
+            lines.append(f"Aliases: {', '.join(v.alert.aliases)}")
+        lines.append(f"Verdict: {v.status} (confidence: {v.confidence})")
+        lines.append(f"Fix commit: {self.fix_commit.resolution_method} (confidence {self.fix_commit.confidence})")
+        if self.fix_commit.sha:
+            lines.append(f"Fix commit SHA: {self.fix_commit.sha}")
+        lines.append("")
+        lines.append(f"Explanation: {v.explanation or 'No explanation recorded.'}")
+        lines.append("")
+        if v.call_path:
+            lines.append("Call path (file:line per hop):")
+            for hop in v.call_path:
+                lines.append(f"  * {hop.file}:{hop.line} — {hop.function}")
+        else:
+            lines.append("Call path: none (no static route to vulnerable code).")
+        lines.append("")
+        if v.dynamic_blockers:
+            lines.append("Dynamic blockers:")
+            for blocker in v.dynamic_blockers:
+                lines.append(f"  * {blocker}")
+        else:
+            lines.append("Dynamic blockers: none.")
+        lines.append("")
+        if self.assumptions:
+            lines.append("User-asserted assumptions (not evidence):")
+            for a in self.assumptions:
+                lines.append(f"  * {a.assumption} (from: “{a.source_message}”))")
+        lines.append("")
+        lines.append("Rules:")
+        lines.append("- Never claim certainty you do not have.")
+        lines.append("- Quote file:line hops when discussing reachability.")
+        lines.append("- A user assertion is not evidence; never flip uncertain to not_reachable based on it.")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ challenges
 
     def _parse_challenge(self, user_message: str) -> str | None:
-        """Return a named function/path if the user challenges not_reachable."""
+        """Return a named function/path if the user challenges not_reachable.
+
+        Only targets that are one of the alert's vulnerable functions, or an
+        explicitly named graph node (qualname or file:line), are accepted.
+        Arbitrary graph nodes cannot be challenged (F-31 soundness).
+        """
         low = user_message.lower()
         if not any(w in low for w in ("reachable", "wrong", "incorrect", "disagree", "path")):
             return None
+
+        # Collect the set of challengeable targets: vulnerable function qualnames
+        # (short and full) plus every graph node qualname / file:line.
+        challengeable: set[str] = set()
+        for vf in self.vulnerable_functions:
+            challengeable.add(vf.qualified_name)
+            challengeable.add(vf.qualified_name.split(".")[-1])
+            challengeable.add(vf.file_path)
+        for node in self.call_graph.graph.nodes:
+            challengeable.add(node.qualname)
+            challengeable.add(node.qualname.split(".")[-1])
+            if node.file:
+                challengeable.add(node.file)
+                challengeable.add(f"{node.file}:{node.line}")
+
         # Look for a function-like name or file:line reference.
         m = re.search(r"\b([A-Za-z_][A-Za-z0-9_.]*\.[A-Za-z_][A-Za-z0-9_]*)\b", user_message)
         if m:
-            return m.group(1)
-        m = re.search(r"([A-Za-z0-9_./-]+\.py)(?::(\d+))?", user_message)
+            candidate = m.group(1)
+            if candidate in challengeable:
+                return candidate
+        m = re.match(r"^(.*?):(\d+)$", user_message.strip())
         if m:
-            return m.group(1)
+            candidate = f"{m.group(1)}:{m.group(2)}"
+            if candidate in challengeable:
+                return candidate
+        # Also try bare file name match.
+        m = re.search(r"\b([A-Za-z0-9_./-]+\.py)\b", user_message)
+        if m:
+            candidate = m.group(1)
+            if candidate in challengeable:
+                return candidate
         return None
 
     def _handle_challenge(self, target: str) -> str:
