@@ -314,6 +314,10 @@ class CallGraphBuilder:
 
     def __init__(self, project_path: str | Path) -> None:
         self.project_path = Path(project_path).resolve()
+        # Detect src/ layout: if the project has a src/ directory containing
+        # packages, strip the "src" prefix from module names so they match
+        # diff-style qualnames (e.g. src/app/lib.py -> app.lib) (F-12).
+        self._src_layout = (self.project_path / "src").is_dir()
         # Per-file collected info
         self._files: list[tuple[str, Path, ast.Module]] = []
         self._file_imports: dict[str, dict[str, _Binding]] = {}
@@ -486,6 +490,13 @@ class CallGraphBuilder:
                 continue
             rel = py.relative_to(self.project_path)
             module = self._rel_to_module(rel)
+            # Canonicalize src/ layout: strip the leading "src" segment so
+            # src/app/lib.py -> app.lib, matching diff-style qualnames (F-12).
+            if self._src_layout and rel.parts and rel.parts[0] == "src":
+                parts = list(rel.parts[1:])
+                if parts and parts[-1].endswith(".py"):
+                    parts = parts[:-1] + [parts[-1][:-3]]
+                module = ".".join(parts)
             files.append((module, py))
         return files
 
@@ -572,7 +583,39 @@ class CallGraphBuilder:
         self._instance_types.setdefault(module, {})
 
         for node in tree.body:
-            self._collect_stmt(module, node)
+            self._collect_stmt_recursive(module, node)
+
+    def _collect_stmt_recursive(self, module: str, node: ast.AST) -> None:
+        """Collect definitions, recursing into compound blocks (If/Try/With/Match).
+
+        Module-level code inside ``if``/``try``/``with``/``match`` blocks can
+        contain imports, function/class definitions, and assignments that must
+        be indexed for sound call-graph construction (F-38).
+        """
+        self._collect_stmt(module, node)
+        # Recurse into compound statement bodies for definitions/imports.
+        if isinstance(node, ast.If):
+            for stmt in node.body + node.orelse:
+                self._collect_stmt_recursive(module, stmt)
+        elif isinstance(node, ast.Try):
+            for stmt in node.body + node.orelse + node.finalbody:
+                self._collect_stmt_recursive(module, stmt)
+            for handler in node.handlers:
+                for stmt in handler.body:
+                    self._collect_stmt_recursive(module, stmt)
+        elif isinstance(node, ast.TryStar):
+            for stmt in node.body + node.orelse + node.finalbody:
+                self._collect_stmt_recursive(module, stmt)
+            for handler in node.handlers:
+                for stmt in handler.body:
+                    self._collect_stmt_recursive(module, stmt)
+        elif isinstance(node, ast.With):
+            for stmt in node.body:
+                self._collect_stmt_recursive(module, stmt)
+        elif isinstance(node, ast.Match):
+            for case in node.cases:
+                for stmt in case.body:
+                    self._collect_stmt_recursive(module, stmt)
 
     def _collect_stmt(self, module: str, node: ast.AST) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -584,14 +627,21 @@ class CallGraphBuilder:
                 self._record_import(module, alias.name, alias.asname)
         elif isinstance(node, ast.ImportFrom):
             level = node.level or 0
+            level = node.level or 0
+            parts: list[str] = []
             if level > 0:
                 base_module = self._relative_base(module, level)
-            else:
-                base_module = node.module
+                if base_module:
+                    parts.append(base_module)
+            if node.module:
+                parts.append(node.module)
+            # Build the full target: base_module + node.module (submodule) + alias.name.
             for alias in node.names:
                 if alias.name == "*":
                     continue
-                target = f"{base_module}.{alias.name}" if base_module else alias.name
+                target_parts = list(parts)
+                target_parts.append(alias.name)
+                target = ".".join(target_parts)
                 local = alias.asname or alias.name
                 self._file_imports[module][local] = _Binding(
                     kind="attr", module=target, attr=alias.name, qualname=target,
@@ -629,7 +679,7 @@ class CallGraphBuilder:
         self._current_class = class_qualname
         self._current_caller = call_node
         for stmt in node.body:
-            self._collect_stmt_in_func(module, stmt, class_qualname)
+            self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
         self._current_class = prev_class
         self._current_caller = prev_caller
         return qualname
@@ -644,14 +694,19 @@ class CallGraphBuilder:
                 self._record_import(module, alias.name, alias.asname)
         elif isinstance(node, ast.ImportFrom):
             level = node.level or 0
+            parts: list[str] = []
             if level > 0:
                 base_module = self._relative_base(module, level)
-            else:
-                base_module = node.module
+                if base_module:
+                    parts.append(base_module)
+            if node.module:
+                parts.append(node.module)
             for alias in node.names:
                 if alias.name == "*":
                     continue
-                target = f"{base_module}.{alias.name}" if base_module else alias.name
+                target_parts = list(parts)
+                target_parts.append(alias.name)
+                target = ".".join(target_parts)
                 local = alias.asname or alias.name
                 self._file_imports[module][local] = _Binding(
                     kind="attr", module=target, attr=alias.name, qualname=target,
@@ -659,10 +714,38 @@ class CallGraphBuilder:
         elif isinstance(node, ast.Assign):
             self._collect_assign(module, node)
 
+    def _collect_stmt_recursive_in_func(
+        self, module: str, node: ast.AST, class_qualname: str | None
+    ) -> None:
+        """Collect definitions in function bodies, recursing into compound blocks."""
+        self._collect_stmt_in_func(module, node, class_qualname)
+        if isinstance(node, ast.If):
+            for stmt in node.body + node.orelse:
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+        elif isinstance(node, ast.Try):
+            for stmt in node.body + node.orelse + node.finalbody:
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+            for handler in node.handlers:
+                for stmt in handler.body:
+                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+        elif isinstance(node, ast.TryStar):
+            for stmt in node.body + node.orelse + node.finalbody:
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+            for handler in node.handlers:
+                for stmt in handler.body:
+                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+        elif isinstance(node, ast.With):
+            for stmt in node.body:
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+        elif isinstance(node, ast.Match):
+            for case in node.cases:
+                for stmt in case.body:
+                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
+
     def _collect_class(self, module: str, node: ast.ClassDef) -> None:
         bases = []
         for base in node.bases:
-            bases.append(self._resolve_base_name(base))
+            bases.append(self._resolve_base_qualname(module, base))
         class_qualname = ".".join([module, node.name])
         self._class_bases[class_qualname] = [b for b in bases if b]
         self._class_methods.setdefault(class_qualname, {})
@@ -672,7 +755,7 @@ class CallGraphBuilder:
         self._current_class = class_qualname
         self._current_caller = None  # class body itself is not a caller
         for stmt in node.body:
-            self._collect_stmt_in_func(module, stmt, class_qualname)
+            self._collect_stmt_recursive_in_func(module, stmt, class_qualname)
         self._current_class = prev_class
         self._current_caller = prev_caller
 
@@ -1002,6 +1085,34 @@ class CallGraphBuilder:
             return base.attr
         return ""
 
+    def _resolve_base_qualname(self, module: str, base: ast.AST) -> str:
+        """Resolve a base class expression to its full qualified name.
+
+        A bare name ``Base`` in the same module resolves to ``module.Base``.
+        An attribute ``other.Base`` resolves to ``other.Base``.
+        """
+        if isinstance(base, ast.Name):
+            name = base.id
+            # If a class with this short name is defined in this module, use
+            # its full qualname; otherwise fall back to the short name.
+            full = f"{module}.{name}"
+            if full in self._class_bases or any(
+                full.split(".")[-1] == name
+                for cls_qual in self._class_bases
+                if cls_qual.split(".")[-1] == name
+            ):
+                return full
+            return name
+        if isinstance(base, ast.Attribute):
+            parts = []
+            node: ast.AST = base
+            while isinstance(node, ast.Attribute):
+                parts.append(node.attr)
+                node = node.value
+            if isinstance(node, ast.Name):
+                return node.id + "." + ".".join(reversed(parts))
+        return ""
+
     def _function_qualname(self, module: str, node: ast.FunctionDef | ast.AsyncFunctionDef, class_qualname: str | None) -> str:
         parts = [module]
         if class_qualname:
@@ -1098,6 +1209,28 @@ class CallGraphBuilder:
                     seen.add(node.qualname)
                     self.entry_points.append(node)
 
+        # Library public API: public functions in packages (directories with
+        # __init__.py) are entry points, since users of the package can call
+        # them.  Standalone modules (no __init__.py) are applications, not
+        # libraries, so their public functions are not automatic entry points
+        # (F-11).
+        package_modules: set[str] = set()
+        for mod, _path, _tree in self._files:
+            parts = mod.split(".")
+            if len(parts) > 1 and parts[-1] == "__init__":
+                package_modules.add(".".join(parts[:-1]))
+        for mod, functions in self._file_functions.items():
+            top_level = mod.split(".")[0]
+            if top_level not in package_modules:
+                continue
+            for qualname, node in functions.items():
+                short = qualname.split(".")[-1]
+                if short.startswith("_"):
+                    continue
+                if node.qualname not in seen:
+                    seen.add(node.qualname)
+                    self.entry_points.append(node)
+
     def _console_script_entries(self) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
         pyproject = self.project_path / "pyproject.toml"
@@ -1116,6 +1249,60 @@ class CallGraphBuilder:
             if cp.has_section("options.entry_points"):
                 for _name, spec in cp.items("options.entry_points"):
                     entries.extend(self._parse_script_spec(spec, setup_cfg))
+        # setup.py parsed with ast (never executed): look for
+        # setup(entry_points={'console_scripts': [...]} or
+        # setup(console_scripts=[...]) (F-11).
+        setup_py = self.project_path / "setup.py"
+        if setup_py.exists():
+            entries.extend(self._parse_setup_py(setup_py))
+        return entries
+
+    def _parse_setup_py(self, setup_py: Path) -> list[dict[str, Any]]:
+        """Parse setup.py with ast to extract console_scripts entry points.
+
+        Never executes setup.py; only inspects the AST for ``setup(...)``
+        calls with ``entry_points`` or ``console_scripts`` keyword arguments.
+        """
+        entries: list[dict[str, Any]] = []
+        try:
+            tree = ast.parse(setup_py.read_text(encoding="utf-8"))
+        except SyntaxError:
+            return entries
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Name) or node.func.id != "setup":
+                continue
+            for kw in node.keywords:
+                if kw.arg == "entry_points":
+                    entries.extend(self._extract_scripts_from_dict(kw.value, setup_py))
+                elif kw.arg == "console_scripts":
+                    entries.extend(self._extract_scripts_from_list(kw.value, setup_py))
+        return entries
+
+    @staticmethod
+    def _extract_scripts_from_dict(node: ast.AST, setup_py: Path) -> list[dict[str, Any]]:
+        """Extract console_scripts from an entry_points dict literal."""
+        entries: list[dict[str, Any]] = []
+        if not isinstance(node, ast.Dict):
+            return entries
+        for k, v in zip(node.keys, node.values):
+            if isinstance(k, ast.Constant) and k.value == "console_scripts":
+                entries.extend(CallGraphBuilder._extract_scripts_from_list(v, setup_py))
+        return entries
+
+    @staticmethod
+    def _extract_scripts_from_list(node: ast.AST, setup_py: Path) -> list[dict[str, Any]]:
+        """Extract console_scripts from a list of ``name = module:function`` strings."""
+        entries: list[dict[str, Any]] = []
+        if not isinstance(node, ast.List):
+            return entries
+        for elt in node.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                entries.extend(
+                    CallGraphBuilder._parse_script_spec(elt.value, setup_py)
+                )
         return entries
 
     @staticmethod

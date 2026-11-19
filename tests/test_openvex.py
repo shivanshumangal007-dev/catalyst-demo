@@ -60,9 +60,9 @@ PROJECT_PURL = "pkg:pypi/demo-app@1.0.0"
 def test_reachable_maps_to_affected_with_action_statement():
     stmt = build_statement(_reachable_verdict(), PROJECT_PURL)
     assert stmt["status"] == "affected"
-    assert stmt["products"] == [PROJECT_PURL]
-    assert stmt["subcomponents"] == ["pkg:pypi/requests@2.25.0"]
-    assert stmt["vulnerability"] == "GHSA-1"
+    assert stmt["products"][0]["@id"] == PROJECT_PURL
+    assert stmt["products"][0]["subcomponents"][0]["@id"] == "pkg:pypi/requests@2.25.0"
+    assert stmt["vulnerability"] == {"name": "GHSA-1"}
     assert "action_statement" in stmt
     assert "Upgrade requests" in stmt["action_statement"]
     assert "app.main@main.py:5" in stmt["action_statement"]
@@ -75,7 +75,7 @@ def test_not_reachable_maps_to_not_affected_with_justification():
     assert stmt["status"] == "not_affected"
     assert stmt["justification"] == "vulnerable_code_not_in_execute_path"
     assert "impact_statement" in stmt
-    assert stmt["subcomponents"] == ["pkg:pypi/django@3.1.0"]
+    assert stmt["products"][0]["subcomponents"][0]["@id"] == "pkg:pypi/django@3.1.0"
 
 
 def test_uncertain_maps_to_under_investigation_with_status_notes():
@@ -97,19 +97,13 @@ def test_purl_without_version():
 
 
 def test_affected_without_action_statement_raises():
-    v = _reachable_verdict()
-    # Strip action_statement by building a verdict whose path is empty -> but
-    # build_statement always adds action_statement for reachable.  Instead,
-    # construct a raw statement dict and pass to _validate_statement via a
-    # verdict that would produce an affected statement without action.
     from vulnreach.vex.openvex import _validate_statement
 
     with pytest.raises(ValueError, match="action_statement"):
         _validate_statement(
             {
-                "vulnerability": "GHSA-1",
-                "products": [PROJECT_PURL],
-                "subcomponents": ["pkg:pypi/requests@2.25.0"],
+                "vulnerability": {"name": "GHSA-1"},
+                "products": [{"@id": PROJECT_PURL}],
                 "status": "affected",
             }
         )
@@ -121,9 +115,8 @@ def test_not_affected_without_justification_raises():
     with pytest.raises(ValueError, match="justification"):
         _validate_statement(
             {
-                "vulnerability": "GHSA-1",
-                "products": [PROJECT_PURL],
-                "subcomponents": ["pkg:pypi/django@3.1.0"],
+                "vulnerability": {"name": "GHSA-1"},
+                "products": [{"@id": PROJECT_PURL}],
                 "status": "not_affected",
             }
         )
@@ -135,9 +128,9 @@ def test_not_affected_with_bad_justification_raises():
     with pytest.raises(ValueError, match="justification"):
         _validate_statement(
             {
-                "vulnerability": "GHSA-1",
-                "products": [PROJECT_PURL],
-                "subcomponents": ["pkg:pypi/django@3.1.0"],
+                "vulnerability": {"name": "GHSA-1"},
+                "products": [{"@id": PROJECT_PURL}],
+                "subcomponents": [{"@id": "pkg:pypi/django@3.1.0"}],
                 "status": "not_affected",
                 "justification": "made-up-justification",
             }

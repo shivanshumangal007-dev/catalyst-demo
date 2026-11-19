@@ -71,7 +71,7 @@ def test_run_isolated_raises_on_failure(tmp_path):
 
     def fake_run(cmd, **kwargs):
         if cmd[1] == "run":
-            return _FakeCompleted(returncode=1, stdout="", stderr="boom")
+            return _FakeCompleted(returncode=2, stdout="", stderr="boom")
         return _FakeCompleted(returncode=0)
 
     runner = _make_runner()
