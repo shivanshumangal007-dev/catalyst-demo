@@ -108,6 +108,7 @@ def _run_pipeline(
     alerts: list[dict[str, Any]],
     cache: CacheStore,
     cache_enabled: bool = True,
+    vuln_functions_overrides: dict[str, list[str]] | None = None,
 ) -> tuple[list[Verdict], list[FixCommit], CallGraphResult]:
     """Run the full analysis pipeline with caching.
 
@@ -154,6 +155,10 @@ def _run_pipeline(
 
         # Build the graph with all missing packages at once.
         builder.build(dependency_name=None, include_dependency=False)
+        # Track every alert package as a dependency so unresolved dependency
+        # calls are detected (previously _dependency_names was empty here, so
+        # unresolved_calls was always empty in the CLI pipeline).
+        builder._dependency_names = set(dep_packages.keys())
         if missing_packages:
             # Collect dependency files for all missing packages.
             all_dep_files: list[tuple[str, Path]] = []
@@ -318,44 +323,68 @@ def _run_pipeline(
         version = alert_data.get("version", "")
         advisory_id = alert_data.get("advisory_id", "")
 
-        # ---- Advisory -> vulnerable functions (cached per package@version).
-        functions_unknown = False
-        cached_advisory = cache.get(package, version, "advisory_functions", advisory_id)
-        if cached_advisory is not None:
-            fix = _fix_commit_from_dict(cached_advisory["fix_commit"])
-            vuln_funcs = [_vuln_function_from_dict(d) for d in cached_advisory.get("vulnerable_functions", [])]
-            functions_unknown = bool(cached_advisory.get("functions_unknown", False))
-        else:
-            record = client.fetch_advisory(advisory_id) if advisory_id else None
-            fix = resolver.resolve(record or {})
-            summary = record.get("summary", "") if record else ""
-            vuln_funcs = diff_to_funcs.functions_for_commit(fix, summary)
-            functions_unknown = diff_to_funcs.functions_unknown
-            # Add public entry points (public functions calling changed private
-            # functions) as additional vulnerable targets -- they are likely user
-            # entry points that reach the vulnerable code.
-            for ep in diff_to_funcs.public_entry_points:
-                if ep not in vuln_funcs:
-                    vuln_funcs.append(ep)
-            cache.put(
-                package,
-                version,
-                "advisory_functions",
-                {
-                    "fix_commit": fix.model_dump(),
-                    "vulnerable_functions": [
-                        {
-                            "module": vf.module,
-                            "qualified_name": vf.qualified_name,
-                            "file_path": vf.file_path,
-                            "confidence": vf.confidence,
-                        }
-                        for vf in vuln_funcs
-                    ],
-                    "functions_unknown": functions_unknown,
-                },
-                advisory_id,
+        # ---- User-supplied vulnerable-function override (offline/demo mode).
+        # maps advisory_id -> list of qualified vulnerable function names.
+        override_names = (vuln_functions_overrides or {}).get(advisory_id)
+        user_supplied = False
+        if override_names is not None:
+            # Offline override: skip OSV/fix-commit/diff entirely.  Confidence is
+            # capped at "manual" (medium) because the fix commit was not
+            # independently resolved, and the verdict notes the user supply.
+            user_supplied = True
+            vuln_funcs = [
+                VulnerableFunction(
+                    module=name.rsplit(".", 1)[0] if "." in name else "",
+                    qualified_name=name,
+                    file_path="",
+                    confidence=0.95,
+                )
+                for name in override_names
+            ]
+            functions_unknown = False
+            fix = FixCommit(
+                repo_url=None, sha=None,
+                resolution_method="not_found", confidence=0.0,
             )
+        else:
+            # ---- Advisory -> vulnerable functions (cached per package@version).
+            functions_unknown = False
+            cached_advisory = cache.get(package, version, "advisory_functions", advisory_id)
+            if cached_advisory is not None:
+                fix = _fix_commit_from_dict(cached_advisory["fix_commit"])
+                vuln_funcs = [_vuln_function_from_dict(d) for d in cached_advisory.get("vulnerable_functions", [])]
+                functions_unknown = bool(cached_advisory.get("functions_unknown", False))
+            else:
+                record = client.fetch_advisory(advisory_id) if advisory_id else None
+                fix = resolver.resolve(record or {})
+                summary = record.get("summary", "") if record else ""
+                vuln_funcs = diff_to_funcs.functions_for_commit(fix, summary)
+                functions_unknown = diff_to_funcs.functions_unknown
+                # Add public entry points (public functions calling changed private
+                # functions) as additional vulnerable targets -- they are likely user
+                # entry points that reach the vulnerable code.
+                for ep in diff_to_funcs.public_entry_points:
+                    if ep not in vuln_funcs:
+                        vuln_funcs.append(ep)
+                cache.put(
+                    package,
+                    version,
+                    "advisory_functions",
+                    {
+                        "fix_commit": fix.model_dump(),
+                        "vulnerable_functions": [
+                            {
+                                "module": vf.module,
+                                "qualified_name": vf.qualified_name,
+                                "file_path": vf.file_path,
+                                "confidence": vf.confidence,
+                            }
+                            for vf in vuln_funcs
+                        ],
+                        "functions_unknown": functions_unknown,
+                    },
+                    advisory_id,
+                )
 
         fix_commits.append(fix)
 
@@ -366,7 +395,9 @@ def _run_pipeline(
             aliases=alert_data.get("aliases", []),
         )
 
-        verdict = analyzer.analyze_alert(alert, vuln_funcs, functions_unknown, fix)
+        verdict = analyzer.analyze_alert(
+            alert, vuln_funcs, functions_unknown, fix, user_supplied_functions=user_supplied
+        )
         verdicts.append(verdict)
 
     return verdicts, fix_commits, call_graph
@@ -470,6 +501,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Run the analysis inside an isolated Docker container",
     )
+    scan.add_argument(
+        "--vuln-functions",
+        type=Path,
+        help="Offline override: JSON mapping advisory_id -> list of qualified "
+        "vulnerable function names (bypasses OSV/fix-commit/diff).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -499,8 +536,19 @@ def main(argv: list[str] | None = None) -> int:
 
         alerts = load_alerts(args.alerts)
         cache = CacheStore(enabled=not args.no_cache)
+        overrides: dict[str, list[str]] = {}
+        if args.vuln_functions:
+            try:
+                overrides = json.loads(args.vuln_functions.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                print(f"error: could not read --vuln-functions {args.vuln_functions}: {exc}", file=sys.stderr)
+                return 1
         verdicts, fix_commits, _call_graph = _run_pipeline(
-            project_path, alerts, cache, cache_enabled=not args.no_cache
+            project_path,
+            alerts,
+            cache,
+            cache_enabled=not args.no_cache,
+            vuln_functions_overrides=overrides,
         )
 
         # Write outputs

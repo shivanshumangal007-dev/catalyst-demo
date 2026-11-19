@@ -1,0 +1,53 @@
+{
+  "alerts": [
+    {
+      "package": "requests",
+      "version": "2.25.0",
+      "advisory_id": "GHSA-j8r2-6x86-q33q",
+      "aliases": [
+        "CVE-2023-32681",
+        "PYSEC-2023-74"
+      ]
+    }
+  ],
+  "fix_commits": [
+    {
+      "repo_url": "https://github.com/psf/requests",
+      "sha": "74ea7cf7a6a27a4eeb2ae24e162bcc942a6706d5",
+      "resolution_method": "direct_link",
+      "confidence": 0.95
+    }
+  ],
+  "verdicts": [
+    {
+      "alert": {
+        "package": "requests",
+        "version": "2.25.0",
+        "advisory_id": "GHSA-j8r2-6x86-q33q",
+        "aliases": [
+          "CVE-2023-32681",
+          "PYSEC-2023-74"
+        ]
+      },
+      "status": "reachable",
+      "confidence": "high",
+      "call_path": [
+        {
+          "file": "main.py",
+          "line": 1,
+          "function": "main.<module>"
+        },
+        {
+          "file": "/private/tmp/vr_e2e_venv/lib/python3.14/site-packages/requests/sessions.py",
+          "line": 273,
+          "function": "requests.sessions.SessionRedirectMixin.rebuild_proxies"
+        }
+      ],
+      "reasons": [
+        "call path from entry point main.<module> to vulnerable function requests.sessions.SessionRedirectMixin.rebuild_proxies"
+      ],
+      "dynamic_blockers": [],
+      "explanation": "Reachable: requests@2.25.0 (GHSA-j8r2-6x86-q33q) -- the vulnerable function requests.sessions.SessionRedirectMixin.rebuild_proxies is reachable from project code via a static call path starting at main.<module>."
+    }
+  ]
+}

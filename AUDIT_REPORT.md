@@ -278,8 +278,8 @@ broken. The README's isolation section, `--isolated` help text, and
 | F-02 | P0 | reachability/analyzer.py:70-78,139-159 | Missing target node → `not_reachable` | `python3 audit_work/probe_core.py` | If `target_nodes` is empty (or fewer than expected), return `uncertain` with a "target not found in graph" reason | **Fixed (Round 1)** |
 | F-03 | P0 | diffing/diff_to_functions.py:193-246 | Added-only hunks ignored | `python3 audit_work/probe_diff.py` | Map added lines too; if only additions, use enclosing function of the added line; if none, mark `functions_unknown=True` | **Fixed (Round 1)** |
 | F-04 | P0 | diffing/diff_to_functions.py:33,407 | `MODULE_RE` lacks `^https://` | `python3 -c` `_repo_parts('https://github.com/psf/requests') is None` | Anchor with `^https?://` and percent-decode; add regression test using real URL | Open |
-| F-05 | P0 | callgraph/builder.py:189-217 | site-packages walked under dependency prefix | `_collect_dependency_files('networkx')` | Resolve the actual top-level package dir (`dist.locate_file(pkg_path)` / `top_level.txt` / `dist.files`) | **Fixed (Round 2)** |
-| F-06 | P0 | callgraph/builder.py:93-123; cli.py:133-175 | Cached dep edges dropped; project→dep edges added before cache | `audit_work/probe_core.py` cache section | Add cached nodes to `_file_functions`, and rebuild project edges after `add_cached_subgraph`; or store/restore the entire merged graph | **Fixed (Round 2)** |
+| F-05 | P0 | callgraph/builder.py:189-217 | site-packages walked under dependency prefix | `_collect_dependency_files('networkx')` | Resolve the actual top-level package dir (`dist.files` / `top_level.txt` / `dist.locate_file` of the package dir); never walk all of site-packages. | **Fixed (Round 4)** |
+| F-06 | P0 | callgraph/builder.py:93-123; cli.py:133-175 | Cached dep edges dropped; project→dep edges added before cache | `audit_work/probe_core.py` cache section | `add_cached_subgraph` registers cached nodes in `_file_functions`; `cli.py` re-resolves project calls after cached subgraphs are registered so cold/warm verdicts are identical. | **Fixed (Round 4)** |
 | F-07 | P0 | callgraph/builder.py:433,473 | `ExceptHandler` not iterable | any `try/except` fixture | Iterate `handler.body` for each `ExceptHandler` | **Fixed (Round 2)** |
 | F-08 | P0 | dynamic_detector.py:88-98 + builder.py:505-512 | Literal getattr not resolved | `probe_calls.py` | Resolve `getattr(obj, "name")` to a call to `obj.name` by rewriting the callee expression / adding edge | **Fixed (Round 2)** |
 | F-09 | P0 | dynamic_detector.py:101-136,154-163 | entry_points/subclasses/registries/aliases missed | `probe_calls.py`, `probe_core.py` | Detect `Name`/`Attribute` forms, `__subclasses__`, any `Subscript` call on a name, and decorator registration | **Fixed (Round 2)** |
@@ -300,7 +300,7 @@ broken. The README's isolation section, `--isolated` help text, and
 | F-24 | P1 | cache/store.py:74-79; cli.py | `--no-cache` does not disable OSV/GitHub HTTP caches; callgraph keyed by first alert only | read | Separate cache namespaces; include all packages; honor disable flag | **Fixed (Round 2)** |
 | F-25 | P1 | callgraph/builder.py:201-207; cli.py:276-281 | Fallback `__import__(dependency)` executes dependency code on host | read | Remove fallback or run it only inside Docker; use `importlib.metadata.files` | **Fixed (Round 2)** |
 | F-26 | P1 | sandbox/docker_runner.py:113-123 | Container exit 1 on reachable is treated as failure | read | Accept exit code 1 as success and parse the report | **Fixed (Round 3)** |
-| F-27 | P1 | Dockerfile:4,13-21 | Base image not digest-pinned; project requirements never installed | read | Pin `python:3.11-slim@sha256:...`; build per-project image installing `--only-binary :all:` pinned deps | **Fixed (Round 3)** |
+| F-27 | P1 | Dockerfile:4,13-21; vulnreach/sandbox/docker_runner.py:132-159 | Base image pinning is present, but project requirements are never installed into the isolated image | read | Build a project-specific image and install pinned deps with `--only-binary :all:` before analysis | **Open** |
 | F-28 | P1 | Dockerfile:18 / .dockerignore absent | Build context copies `.git`, potential `.env`/secrets into image | read | Add `.dockerignore`; copy only needed files | **Fixed (Round 3)** |
 | F-29 | P1 | tests/test_docker_runner.py:24-63 | Test mocks `subprocess.run`, never verifies real isolation | read | Add a real Docker smoke test (behind a marker) | **Fixed (Round 3)** |
 | F-30 | P1 | agent/pr_chat.py:148,154-181 | `llm_client` is stored but never called; pluggable LLM is dead code | grep `llm_client` | Call `self.llm_client.chat(...)` with evidence-only system prompt, or remove the claim | **Fixed (Round 3)** |
@@ -548,6 +548,12 @@ the safety rule. A stale entry can produce a wrong `not_reachable` after an
 analyzer change unless `ANALYZER_VERSION` is manually bumped; the hash only
 changes when the constant changes (F-24).
 
+**Round 4 fix:** `add_cached_subgraph` now registers cached dependency nodes in
+`_file_functions` so `_find_node` resolves them, and `cli.py` re-resolves
+project calls after cached subgraphs are restored. Verified [exec]: cold and
+warm runs now produce byte-identical verdicts and the warm run logs a cache hit
+(`tests/test_cli_cache_integration.py::test_override_cold_warm_byte_identical`).
+
 Multi-alert [exec]: alert #2's package is absent from the graph → `not_reachable`.
 
 ---
@@ -574,6 +580,17 @@ imported or executed on the host. Its module-level payloads write
 | build context | `test -e /workspace/audit_work` | FAIL `AUDIT_WORK_PRESENT` (F-28) |
 | base image pinned | `Dockerfile:4` | FAIL `python:3.11-slim`, no digest (F-27) |
 | target project deps installed | `Dockerfile` | FAIL only VulnReach deps are installed (F-27) |
+
+**F-27 isolation dependency note:** the base image is pinned by digest, but
+`DockerRunner._ensure_image()` reuses or builds a repository-wide tool image;
+it does not construct a project-specific image or install the target project's
+`requirements.txt`, `pyproject.toml`, or locked dependency set. A dependency
+present in the host throwaway venv is therefore not automatically available in
+an isolated container, and the static-analysis container cannot silently claim
+that dependency code was resolved. This finding remains open for project-specific
+dependency installation. The project's pinned dependencies must be installed
+inside the isolated build image before a real isolated verdict can be compared
+with the non-isolated scan.
 
 An earlier hostile fixture contained a `try/except`; the direct in-container
 scan crashed with `TypeError: 'ExceptHandler' object is not iterable` at

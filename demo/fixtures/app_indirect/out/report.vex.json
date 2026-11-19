@@ -1,0 +1,27 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "urn:uuid:1b92f7ab-31eb-3d85-bcfc-58fdd8472a67",
+  "author": "vulnreach",
+  "timestamp": "2026-11-19T07:18:53Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "A-1"
+      },
+      "products": [
+        {
+          "@id": "pkg:pypi/app_indirect@0.0.0",
+          "subcomponents": [
+            {
+              "@id": "pkg:pypi/lib@1.0.0"
+            }
+          ]
+        }
+      ],
+      "status": "affected",
+      "action_statement": "Upgrade lib from 1.0.0 to a patched version. Vulnerable code is reachable via: main.<module>@main.py:1 -> lib.public_api@lib.py:4 -> lib.vulnerable_function@lib.py:1",
+      "impact_statement": "main.<module>@main.py:1 -> lib.public_api@lib.py:4 -> lib.vulnerable_function@lib.py:1"
+    }
+  ]
+}

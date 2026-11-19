@@ -387,7 +387,7 @@ class CallGraphBuilder:
         # Dict-literal bindings: (dict_var_name, key) -> CallNode for
         # d = {'k': lib.vulnerable} style tracking.
         self._dict_bindings: dict[str, dict[tuple[str, Any], CallNode]] = {}
-        self._dependency_name: str | None = None
+        self._dependency_names: set[str] = set()
 
     # ------------------------------------------------------------------ cached subgraph
 
@@ -434,14 +434,23 @@ class CallGraphBuilder:
 
     def build(
         self,
-        dependency_name: str | None = None,
+        dependency_name: str | list[str] | None = None,
         include_dependency: bool = True,
     ) -> CallGraphResult:
+        """Build the call graph.
+
+        ``dependency_name`` may be a single package or a list of packages
+        (e.g. a whole chain ``pkgA -> pkgB``) so that transitive dependency
+        targets are present in the same graph.
+        """
         self._reset()
-        self._dependency_name = dependency_name if include_dependency else None
+        deps: list[str] = []
+        if include_dependency and dependency_name:
+            deps = [dependency_name] if isinstance(dependency_name, str) else list(dependency_name)
+        self._dependency_names = set(deps)
         files = self._collect_project_files()
-        if dependency_name and include_dependency:
-            files.extend(self._collect_dependency_files(dependency_name))
+        for dep in deps:
+            files.extend(self._collect_dependency_files(dep))
 
         # Pass 1: parse + collect definitions, imports, classes, instance types
         for module, path in files:
@@ -519,7 +528,7 @@ class CallGraphBuilder:
         self._framework_functions = set()
         self.unparsed_files = []
         self.unresolved_calls = []
-        self._dependency_name = None
+        self._dependency_names = set()
         self._accounted_calls = set()
         self._all_call_sites = []
         self._dynamic_imports = {}
@@ -547,6 +556,82 @@ class CallGraphBuilder:
             files.append((module, py))
         return files
 
+    def _dependency_package_dirs(
+        self, dist: "importlib.metadata.PathDistribution", dependency_name: str
+    ) -> list[Path]:
+        """Return the actual top-level package directory(ies) for a distribution.
+
+        Prefer ``top_level.txt`` (each entry located via ``dist.locate_file``),
+        then ``dist.files()`` (common top-level prefix), then a fallback that
+        looks for a subdirectory matching the dependency name under
+        ``dist.locate_file("")``.  Never walks all of site-packages, so module
+        names stay ``<dependency>.<submodule>`` instead of being doubled
+        (e.g. ``mydep.api`` not ``mydep.mydep.api``) (F-05).
+        """
+        normalized = dependency_name.lower().replace("-", "_").replace(".", "_")
+        dirs: list[Path] = []
+
+        # 1. top_level.txt lists every top-level module/package of the dist.
+        try:
+            top_level = dist.read_text("top_level.txt")
+        except Exception:
+            top_level = None
+        if top_level:
+            for mod in top_level.split():
+                try:
+                    d = dist.locate_file(mod)
+                except Exception:
+                    d = None
+                if d is not None and d.is_dir():
+                    dirs.append(d)
+            if dirs:
+                return dirs
+
+        # 2. dist.files() lists every installed file; the first path component
+        #    is the top-level package (or a single top-level module).
+        try:
+            files = dist.files()
+        except Exception:
+            files = None
+        if files:
+            tops: set[str] = set()
+            for f in files:
+                parts = [str(p) for p in f.parts]
+                if not parts:
+                    continue
+                if parts[-1].endswith(".py") and len(parts) == 1:
+                    tops.add(parts[0][:-3])
+                else:
+                    tops.add(parts[0])
+            for top in tops:
+                if top.lower().replace("-", "_").replace(".", "_") == normalized:
+                    try:
+                        d = dist.locate_file(top)
+                    except Exception:
+                        d = None
+                    if d is not None and d.is_dir():
+                        dirs.append(d)
+            if dirs:
+                return dirs
+
+        # 3. Fallback: locate_file("") is typically the site-packages root; look
+        #    for a subdirectory matching the dependency.  Only use locate_file("")
+        #    itself when it *is* the package directory (its name matches the
+        #    dependency), which avoids walking all of site-packages (F-05).
+        try:
+            base = dist.locate_file("")
+        except Exception:
+            base = None
+        if base is not None and base.is_dir():
+            for cand in (base / dependency_name, base / normalized):
+                if cand.is_dir():
+                    dirs.append(cand)
+                    break
+            else:
+                if base.name.lower().replace("-", "_").replace(".", "_") == normalized:
+                    dirs.append(base)
+        return dirs
+
     def _collect_dependency_files(self, dependency_name: str) -> list[tuple[str, Path]]:
         """Locate the *actual* top-level package directory for an installed
         distribution using ``importlib.metadata.files`` / ``top_level.txt``.
@@ -559,38 +644,16 @@ class CallGraphBuilder:
         except importlib.metadata.PackageNotFoundError:
             return files
 
-        # Determine the package's top-level directory.
-        top_level_dirs: list[str] = []
-        try:
-            top_level = dist.read_text("top_level.txt")
-            if top_level:
-                top_level_dirs = [t for t in top_level.split() if t]
-        except Exception:
-            pass
-
-        base: Path | None = None
-        if top_level_dirs:
-            try:
-                base = dist.locate_file(top_level_dirs[0])
-            except Exception:
-                base = None
-        if base is None or not base.is_dir():
-            try:
-                base = dist.locate_file("")
-            except Exception:
-                base = None
-        if base is None or not base.is_dir():
-            return files
-
-        for py in sorted(base.rglob("*.py")):
-            if any(part in {".git", "__pycache__", "tests", "test"} for part in py.parts):
-                continue
-            try:
-                rel = py.relative_to(base)
-            except ValueError:
-                continue
-            module = dependency_name + "." + self._rel_to_module(rel)
-            files.append((module, py))
+        for base in self._dependency_package_dirs(dist, dependency_name):
+            for py in sorted(base.rglob("*.py")):
+                if any(part in {".git", "__pycache__", "tests", "test"} for part in py.parts):
+                    continue
+                try:
+                    rel = py.relative_to(base)
+                except ValueError:
+                    continue
+                module = dependency_name + "." + self._rel_to_module(rel)
+                files.append((module, py))
         return files
 
     @staticmethod
@@ -861,10 +924,28 @@ class CallGraphBuilder:
         self._file_imports[module][local] = _Binding(kind="module", module=name, attr=None, qualname=name)
 
     def _relative_base(self, module: str, level: int) -> str | None:
-        parts = module.split(".")
-        if level >= len(parts):
+        """Resolve the base package for a relative import.
+
+        ``from .X`` (level 1) resolves to the current package; ``from ..X``
+        (level 2) to its parent, and so on.  A top-level package's own
+        ``__init__.py`` is its own package, so ``from .X`` there keeps the
+        package name rather than escaping to the top level.
+        """
+        if level < 1:
             return None
-        return ".".join(parts[: len(parts) - level]) if level > 0 else None
+        parts = module.split(".")
+        # The package containing this module: drop the last part for
+        # submodules; a single-part (top-level package) module is its own
+        # package.
+        package = parts[0] if len(parts) == 1 else ".".join(parts[:-1])
+        if level == 1:
+            return package
+        # Go up ``level - 1`` further from the package.
+        pkg_parts = package.split(".")
+        up = level - 1
+        if up >= len(pkg_parts):
+            return ""  # escapes to the top level
+        return ".".join(pkg_parts[: len(pkg_parts) - up])
 
     def _path_for_module(self, module: str) -> Path:
         for mod, path, _tree in self._files:
@@ -1018,9 +1099,17 @@ class CallGraphBuilder:
             return "<unprintable>"
 
     def _call_targets_dependency(self, module: str, func_expr: ast.AST) -> bool:
-        """Return True when a call's receiver is imported from the dependency."""
-        dependency = self._dependency_name
-        if not dependency:
+        """Return True when a call's receiver is imported from a dependency.
+
+        A binding that names a *specific* function/class must resolve to an
+        actual graph node within the dependency -- otherwise a submodule that
+        merely re-exports stdlib (e.g. ``requests.compat.urlparse``) would be
+        mistaken for a dependency call and stdlib noise would block a
+        ``not_reachable`` verdict.  Plain module bindings (``import dep``) are
+        still treated as dependency-targeted.
+        """
+        deps = self._dependency_names
+        if not deps:
             return False
         root = self._root_name(func_expr)
         if root is None:
@@ -1029,7 +1118,11 @@ class CallGraphBuilder:
         if binding is None:
             return False
         target = binding.qualname or binding.module or ""
-        return target == dependency or target.startswith(dependency + ".")
+        if not any(target == d or target.startswith(d + ".") for d in deps):
+            return False
+        if binding.kind != "module":
+            return self._find_node(target) is not None
+        return True
 
     @staticmethod
     def _root_name(func_expr: ast.AST) -> str | None:
@@ -1124,6 +1217,13 @@ class CallGraphBuilder:
             node = self._find_node(import_binding.qualname)
             if node:
                 return [node], False
+            # Follow import re-export chains: ``from pkg import v`` where
+            # ``pkg/__init__.py`` does ``from .core import vulnerable as v``.
+            # Resolve the binding's qualname as module.attr through the
+            # defining module's own imports.
+            node = self._resolve_import_reexport(import_binding.qualname)
+            if node is not None:
+                return [node], False
         # Same-module class constructor: Thing() -> Thing.__init__
         for class_qualname in self._class_nodes:
             if class_qualname.split(".")[-1] == name:
@@ -1132,6 +1232,46 @@ class CallGraphBuilder:
                     return [init], False
         # Over-approximate: all functions with this short name
         return list(self._name_index.get(name, [])), True
+
+    def _resolve_import_reexport(self, qualname: str) -> CallNode | None:
+        """Follow an import re-export chain like ``pkg.v`` -> ``pkg.core.vulnerable``.
+
+        ``qualname`` is a dotted name produced by an import binding (e.g. the
+        ``v`` bound by ``from pkg import v`` where pkg re-exports it).  The first
+        segment is a package; its namespace lives in ``<pkg>.__init__``, so we
+        look that up too.  Walk the attribute chain through each module's import
+        bindings and return the resolved graph node, if any.
+        """
+        parts = qualname.split(".")
+        if len(parts) < 2:
+            return None
+        root = parts[0]
+        # A package's namespace is defined by its ``__init__`` module, which is
+        # collected under the ``<pkg>.__init__`` module name.
+        candidates = [root, root + ".__init__"]
+        binding = None
+        for cand in candidates:
+            binding = self._file_imports.get(cand, {}).get(parts[1])
+            if binding is not None:
+                break
+        if binding is None:
+            return None
+        current = binding.qualname or binding.module or ""
+        if not current:
+            return None
+        # Remaining segments (shouldn't normally happen for simple re-exports).
+        for attr in parts[2:]:
+            found = None
+            for cand in (current, current + ".__init__"):
+                found = self._file_imports.get(cand, {}).get(attr)
+                if found is not None:
+                    break
+            if found is None:
+                return None
+            current = found.qualname or found.module or ""
+            if not current:
+                return None
+        return self._find_node(current)
 
     def _resolve_attribute_call(self, module: str, expr: ast.Attribute) -> tuple[list[CallNode], bool]:
         attr = expr.attr

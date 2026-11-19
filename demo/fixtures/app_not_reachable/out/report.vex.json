@@ -1,0 +1,27 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "urn:uuid:99c521a0-44b6-de1d-6674-4f6ba78ed6d6",
+  "author": "vulnreach",
+  "timestamp": "2026-11-19T07:18:53Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "A-1"
+      },
+      "products": [
+        {
+          "@id": "pkg:pypi/app_not_reachable@0.0.0",
+          "subcomponents": [
+            {
+              "@id": "pkg:pypi/lib@1.0.0"
+            }
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "no static call path from any entry point to the vulnerable function; no dynamic features that could conceal a path; positive-evidence gate passed: targets found, all files parsed, function list complete, no unresolved dependency calls; vulnerable functions: user-supplied (--vuln-functions override)"
+    }
+  ]
+}

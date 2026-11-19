@@ -131,6 +131,20 @@ class UserAssumption:
 class PRChatAgent:
     """Debate a vulnerability verdict using only report evidence."""
 
+    # Prompt-injection phrases that attempt to override the agent's instructions.
+    # These are never treated as valid assumptions or challenges and do not
+    # alter the verdict; they are refused outright.
+    PROMPT_INJECTION_PHRASES = (
+        "ignore all previous instructions",
+        "ignore prior instructions",
+        "disregard your instructions",
+        "forget your instructions",
+        "override your instructions",
+        "you are now",
+        "always answer",
+        "always respond",
+    )
+
     def __init__(
         self,
         verdict: Verdict,
@@ -174,18 +188,25 @@ class PRChatAgent:
         """
         self.conversation.append({"role": "user", "content": user_message})
 
-        # Detect a challenge to a not_reachable verdict naming a function.
-        challenged_target = self._parse_challenge(user_message)
-        if self.verdict.status == "not_reachable" and challenged_target is not None:
-            reply = self._handle_challenge(challenged_target)
+        # Refuse prompt-injection attempts before treating the message as an
+        # assumption or challenge: they are not valid inputs and must not alter
+        # the verdict or be recorded as assumptions.
+        injection = self._is_prompt_injection(user_message)
+        if injection is not None:
+            reply = self._refuse_prompt_injection(injection)
         else:
-            # Detect a user-supplied assumption about a dynamic feature.
-            assumption = self._parse_assumption(user_message)
-            if assumption is not None:
-                self.assumptions.append(assumption)
-                reply = self._handle_assumption(assumption)
+            # Detect a challenge to a not_reachable verdict naming a function.
+            challenged_target = self._parse_challenge(user_message)
+            if self.verdict.status == "not_reachable" and challenged_target is not None:
+                reply = self._handle_challenge(challenged_target)
             else:
-                reply = self._general_reply(user_message)
+                # Detect a user-supplied assumption about a dynamic feature.
+                assumption = self._parse_assumption(user_message)
+                if assumption is not None:
+                    self.assumptions.append(assumption)
+                    reply = self._handle_assumption(assumption)
+                else:
+                    reply = self._general_reply(user_message)
 
         self.conversation.append({"role": "assistant", "content": reply})
         return reply
@@ -501,6 +522,30 @@ class PRChatAgent:
             f"I re-checked `{target}` and confirm: no static call path reaches it, and "
             f"no dynamic features could hide one. The verdict (**{v.status}**, "
             f"confidence {v.confidence}) stands."
+        )
+
+    def _is_prompt_injection(self, user_message: str) -> str | None:
+        """Detect an attempt to override the agent's instructions.
+
+        Returns the matched phrase if the message looks like a prompt-injection
+        attempt, else ``None``.
+        """
+        low = user_message.lower()
+        for phrase in self.PROMPT_INJECTION_PHRASES:
+            if phrase in low:
+                return phrase
+        return None
+
+    def _refuse_prompt_injection(self, phrase: str) -> str:
+        """Refuse a prompt-injection attempt without changing the verdict.
+
+        The attempt is not recorded as an assumption, so the stored verdict and
+        any VEX produced from it are unaffected.
+        """
+        return (
+            "I cannot comply with that request. I answer only from the evidence "
+            "in the analysis report and do not accept instructions that override "
+            "my analysis. The verdict is unchanged."
         )
 
     # ------------------------------------------------------------------ assumptions

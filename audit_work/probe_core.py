@@ -141,7 +141,7 @@ if __name__ == "__main__":
     proj = make("transitive", {"main.py": "from pkgA.api import public_a\npublic_a()\n"})
     with patch("importlib.metadata.distribution", side_effect=fake_dist_factory({"pkgA": dep2, "pkgB": dep2})):
         run("transitive A->B target", proj,
-            [vf("pkgB.core.vuln_b", "pkgB/core.py", "pkgB.core")], dep="pkgA")
+            [vf("pkgB.core.vuln_b", "pkgB/core.py", "pkgB.core")], dep=["pkgA", "pkgB"])
 
     print("== cache warm graph ==")
     with patch("importlib.metadata.distribution", side_effect=fake_dist_factory({"mydep": dep_root})):

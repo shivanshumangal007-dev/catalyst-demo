@@ -1,0 +1,8 @@
+[
+  {
+    "package": "requests",
+    "version": "2.25.0",
+    "advisory_id": "GHSA-j8r2-6x86-q33q",
+    "aliases": ["CVE-2023-32681", "PYSEC-2023-74"]
+  }
+]

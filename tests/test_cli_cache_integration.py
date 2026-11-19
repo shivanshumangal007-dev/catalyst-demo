@@ -178,3 +178,73 @@ def test_multi_alert_all_packages_in_graph(tmp_path, monkeypatch):
 
     # Both verdicts must be reachable (both packages are called).
     assert [v.status for v in verdicts] == ["reachable", "reachable"]
+
+
+# ------------------------------------------------------------------ F-06: cold/warm equivalence with an override (no network)
+
+
+def test_override_cold_warm_byte_identical(tmp_path, monkeypatch, caplog):
+    """Cold and warm cache runs on an override-based fixture must produce
+    byte-identical verdicts, and the warm run must log a cache hit.
+
+    The override (``--vuln-functions``) bypasses OSV/fix-commit/diff, so the
+    only thing cached across runs is the dependency call graph.  A warm run
+    must therefore log a "cache hit" for the dependency callgraph and emit the
+    exact same verdicts as the cold run.  (F-06)
+    """
+    # dependency: dep.api.public -> dep.core.vulnerable
+    dep_root = tmp_path / "dep_root"
+    (dep_root / "dep").mkdir(parents=True)
+    (dep_root / "dep" / "__init__.py").write_text("")
+    (dep_root / "dep" / "core.py").write_text("def vulnerable():\n    return 1\n")
+    (dep_root / "dep" / "api.py").write_text(
+        "from .core import vulnerable\ndef public():\n    return vulnerable()\n"
+    )
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "main.py").write_text("from dep.api import public\npublic()\n")
+
+    alerts = [
+        {"package": "dep", "version": "1.0.0", "advisory_id": "A-1"},
+    ]
+    overrides = {"A-1": ["dep.core.vulnerable"]}
+
+    class FakeDist:
+        def locate_file(self, rel):
+            return dep_root / rel
+
+    monkeypatch.setattr(
+        "importlib.metadata.distribution",
+        lambda name: FakeDist() if name == "dep" else (_ for _ in ()).throw(
+            importlib.metadata.PackageNotFoundError(name)
+        ),
+    )
+
+    cache_db = tmp_path / "cache.sqlite"
+
+    # Cold run: fresh cache, dependency graph built and stored.
+    store_cold = CacheStore(db_path=cache_db)
+    verdicts_cold, _, _ = _run_pipeline(
+        project, alerts, store_cold, cache_enabled=True,
+        vuln_functions_overrides=overrides,
+    )
+    cold_bytes = json.dumps(
+        [v.model_dump() for v in verdicts_cold], sort_keys=True
+    ).encode("utf-8")
+    assert verdicts_cold[0].status == "reachable"
+
+    # Warm run: same cache db -> dependency callgraph cache hit.
+    store_warm = CacheStore(db_path=cache_db)
+    with caplog.at_level("INFO", logger="vulnreach.cache"):
+        verdicts_warm, _, _ = _run_pipeline(
+            project, alerts, store_warm, cache_enabled=True,
+            vuln_functions_overrides=overrides,
+        )
+    warm_bytes = json.dumps(
+        [v.model_dump() for v in verdicts_warm], sort_keys=True
+    ).encode("utf-8")
+
+    assert warm_bytes == cold_bytes, "warm cache changed the verdicts"
+    assert verdicts_warm[0].status == "reachable"
+    assert any("cache hit" in r.getMessage() for r in caplog.records), "expected a cache hit on the warm run"
+

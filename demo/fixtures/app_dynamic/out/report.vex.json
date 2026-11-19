@@ -1,0 +1,27 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "urn:uuid:a5ec239d-08b6-315f-72ee-317ec663f0db",
+  "author": "vulnreach",
+  "timestamp": "2026-11-19T07:18:53Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "A-1"
+      },
+      "products": [
+        {
+          "@id": "pkg:pypi/app_dynamic@0.0.0",
+          "subcomponents": [
+            {
+              "@id": "pkg:pypi/lib@1.0.0"
+            }
+          ]
+        }
+      ],
+      "status": "under_investigation",
+      "status_notes": "/Users/shivanshumangal/Coding/Projects/catalyst-demo/demo/fixtures/app_dynamic/main.py:4 [getattr] getattr(obj, <non-literal>)",
+      "impact_statement": "dynamic call sites are present; dynamic Python features could hide a reachable path"
+    }
+  ]
+}

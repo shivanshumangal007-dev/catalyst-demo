@@ -2,13 +2,13 @@
   {
     "package": "requests",
     "version": "2.25.0",
-    "advisory_id": "GHSA-cc3m-4wpp-2x39",
-    "aliases": ["CVE-2020-26137", "PYSEC-2020-220"]
+    "advisory_id": "GHSA-j8r2-6x86-q33q",
+    "aliases": ["CVE-2023-32681", "PYSEC-2023-74"]
   },
   {
-    "package": "django",
+    "package": "pillow",
     "version": "3.1.0",
     "advisory_id": "PYSEC-2021-35",
-    "aliases": ["CVE-2021-23338"]
+    "aliases": ["CVE-2021-25289", "GHSA-57h3-9rgr-c24m"]
   }
 ]

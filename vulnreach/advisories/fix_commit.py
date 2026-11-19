@@ -17,6 +17,7 @@ responses are cached in a local SQLite file.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -40,6 +41,8 @@ PACKAGE_REF_RE = re.compile(r"github.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
 
 # Reference types that may carry a direct commit URL.
 DIRECT_REF_TYPES = {"FIX", "WEB", "ADVISORY"}
+
+logger = logging.getLogger("vulnreach.fix_commit")
 
 
 class FixCommitResolver:
@@ -67,15 +70,27 @@ class FixCommitResolver:
 
     def resolve(self, record: dict[str, Any]) -> FixCommit:
         """Return the best-effort fix commit for ``record``."""
+        advisory_id = record.get("id", "<unknown>")
+        repo_url = self._repo_url_from_record(record)
+        logger.info(
+            "fix_commit.resolve %s: repo_url=%s, refs=%s",
+            advisory_id,
+            repo_url,
+            [ref.get("url") for ref in (record.get("references") or []) if ref.get("url")],
+        )
         result = self._direct_link(record)
         if result is not None:
+            logger.info("fix_commit.resolve %s -> direct_link %s (confidence 0.95)", advisory_id, result.sha)
             return result
         result = self._pr_reference(record)
         if result is not None:
+            logger.info("fix_commit.resolve %s -> pr_reference %s (confidence 0.70)", advisory_id, result.sha)
             return result
         result = self._tag_diff(record)
         if result is not None:
+            logger.info("fix_commit.resolve %s -> tag_diff %s (confidence 0.50)", advisory_id, result.sha)
             return result
+        logger.warning("fix_commit.resolve %s -> not_found (no fix commit could be resolved)", advisory_id)
         return FixCommit(resolution_method="not_found", confidence=0.0)
 
     # ------------------------------------------------------------------ method 1: direct link
@@ -95,27 +110,39 @@ class FixCommitResolver:
                     fixed = event.get("fixed")
                     sha = self._sha_from_fixed_event(fixed)
                     if sha:
+                        logger.info(
+                            "direct_link: GIT range fixed event -> sha=%s repo=%s", sha, repo_url
+                        )
                         return FixCommit(
                             repo_url=repo_url,
                             sha=sha,
                             resolution_method="direct_link",
                             confidence=0.95,
                         )
+            if not any(rng.get("type") == "GIT" for rng in aff.get("ranges") or []):
+                logger.debug("direct_link: no GIT range in affected entry")
 
         # Any reference of type FIX / WEB / ADVISORY containing /commit/<sha>.
         for ref in record.get("references") or []:
             ref_type = ref.get("type", "").upper()
+            url = ref.get("url") or ""
             if ref_type not in DIRECT_REF_TYPES:
                 continue
-            url = ref.get("url") or ""
             m = COMMIT_URL_RE.search(url)
             if m:
+                resolved_repo = self._github_repo_url(url) or repo_url
+                logger.info(
+                    "direct_link: %s reference commit URL %s -> sha=%s repo=%s",
+                    ref_type, url, m.group(1), resolved_repo,
+                )
                 return FixCommit(
-                    repo_url=self._github_repo_url(url) or repo_url,
+                    repo_url=resolved_repo,
                     sha=m.group(1),
                     resolution_method="direct_link",
                     confidence=0.95,
                 )
+            logger.debug("direct_link: %s reference %s has no /commit/<sha>", ref_type, url)
+        logger.debug("direct_link: no GIT fixed event or commit reference found")
         return None
 
     @staticmethod
@@ -217,12 +244,25 @@ class FixCommitResolver:
                     if isinstance(fixed, str):
                         first_fixed = self._min_version(first_fixed, fixed)
 
-        if not (repo_url and last_vuln and first_fixed):
+        if not repo_url:
+            logger.warning(
+                "tag_diff: no repository URL available for %s (no package.repository or PACKAGE ref); cannot clone/diff",
+                record.get("id", "<unknown>"),
+            )
+            return None
+        if not (last_vuln and first_fixed):
+            logger.debug(
+                "tag_diff: incomplete ecosystem range (last_vuln=%s, first_fixed=%s)",
+                last_vuln,
+                first_fixed,
+            )
             return None
 
         sha = self._git_tag_diff_commit(repo_url, last_vuln, first_fixed)
         if sha is None:
+            logger.warning("tag_diff: could not resolve tag diff commit for %s@%s..%s", repo_url, last_vuln, first_fixed)
             return None
+        logger.info("tag_diff: resolved %s..%s -> %s", last_vuln, first_fixed, sha)
         return FixCommit(
             repo_url=repo_url,
             sha=sha,

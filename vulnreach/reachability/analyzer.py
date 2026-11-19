@@ -51,12 +51,18 @@ class ReachabilityAnalyzer:
         vulnerable_functions: list,
         functions_unknown: bool,
         fix_commit: FixCommit,
+        user_supplied_functions: bool = False,
     ) -> Verdict:
         """Return a :class:`Verdict` for a single alert.
 
         ``vulnerable_functions`` is a list of :class:`VulnerableFunction`.  When
         ``functions_unknown`` is true the list is empty and we must emit
         ``uncertain``.
+
+        When ``user_supplied_functions`` is true the vulnerable functions came
+        from a user-supplied override (``--vuln-functions``): the verdict's
+        explanation notes that, and confidence is capped at ``medium`` (manual)
+        because the fix commit was not independently resolved.
         """
         # Step 1: we could not determine the vulnerable functions -> uncertain.
         if functions_unknown:
@@ -93,35 +99,29 @@ class ReachabilityAnalyzer:
                 ),
             )
 
-        # Step 3: unresolved call sites could hide a path to the vulnerable
-        # function.  This check runs *before* the path search so that a resolved
-        # path cannot mask an unresolved call that might reach the same target
-        # through a different route.  Soundness over precision.
-        unresolved = list(getattr(self.call_graph, "unresolved_calls", []))
-        if unresolved:
-            joined = ", ".join(unresolved[:5])
-            suffix = "" if len(unresolved) <= 5 else f" (+{len(unresolved) - 5} more)"
-            return self._uncertain(
-                alert,
-                reasons=[
-                    f"unresolved call site(s) could reach the vulnerable function: {joined}{suffix}"
-                ],
-                blockers=unresolved,
-                explanation=(
-                    f"Uncertain: {alert.package}@{alert.version} "
-                    f"({alert.advisory_id}) -- the analysis found call site(s) that "
-                    f"could not be resolved to a graph node and might reach the "
-                    f"vulnerable function through a hidden path."
-                ),
-            )
+        # NOTE (removed): a pre-search "unresolved calls => uncertain" block used
+        # to live here.  That was unsound: unresolved call sites can only *add*
+        # reachability, they cannot negate a statically confirmed path.  If a
+        # path to a vulnerable target exists, the verdict is ``reachable``
+        # regardless of unrelated unresolved calls.  Unresolved calls are still
+        # enforced by the positive-evidence gate below, which only blocks the
+        # negative (``not_reachable``) claim when no path was found.
 
         # Step 4: locate target nodes in the graph and search for a path.
-        target_nodes, target_problems = self._target_nodes(vulnerable_functions)
+        target_nodes, target_problems = self._target_nodes(
+            vulnerable_functions, user_supplied=user_supplied_functions
+        )
         best_path: list[CallNode] | None = None
 
         if target_nodes:
             for entry in self.entry_points:
                 for target in target_nodes:
+                    # A target that is itself an entry point reaches itself
+                    # trivially (path of length 1); that is not project code
+                    # reaching the target, so skip it.  Unresolved calls are
+                    # handled by the positive-evidence gate below.
+                    if entry.qualname == target.qualname and entry.file == target.file:
+                        continue
                     try:
                         path = nx.shortest_path(self.graph, entry, target)
                     except (nx.NetworkXNoPath, nx.NodeNotFound):
@@ -134,7 +134,7 @@ class ReachabilityAnalyzer:
                 self.graph[best_path[i]][best_path[i + 1]].get("over_approx", False)
                 for i in range(len(best_path) - 1)
             )
-            confidence = "medium" if over_approx else "high"
+            confidence = "medium" if over_approx or user_supplied_functions else "high"
             call_path = [
                 PathHop(file=self._rel(node.file), line=node.line, function=node.qualname)
                 for node in best_path
@@ -145,12 +145,19 @@ class ReachabilityAnalyzer:
             ]
             if over_approx:
                 reasons.append("path traverses an over-approximated (indirect) edge")
+            if user_supplied_functions:
+                reasons.append("vulnerable functions: user-supplied (--vuln-functions override)")
             explanation = (
                 f"Reachable: {alert.package}@{alert.version} "
                 f"({alert.advisory_id}) -- the vulnerable function "
                 f"{best_path[-1].qualname} is reachable from project code via a "
                 f"static call path starting at {best_path[0].qualname}."
             )
+            if user_supplied_functions:
+                explanation += (
+                    " Vulnerable functions: user-supplied (--vuln-functions override); "
+                    "fix-commit confidence capped at manual."
+                )
             return self._verdict(
                 alert,
                 status="reachable",
@@ -193,7 +200,10 @@ class ReachabilityAnalyzer:
             )
 
         # Step 6: every precondition holds and there is no path -> not_reachable.
-        confidence = "high" if fix_commit.resolution_method == "direct_link" else "medium"
+        if user_supplied_functions:
+            confidence = "medium"  # user-supplied override: cap at manual
+        else:
+            confidence = "high" if fix_commit.resolution_method == "direct_link" else "medium"
         target_names = ", ".join(vf.qualified_name for vf in vulnerable_functions) or "<none identified>"
         reasons = [
             "no static call path from any entry point to the vulnerable function",
@@ -201,11 +211,18 @@ class ReachabilityAnalyzer:
             "positive-evidence gate passed: targets found, all files parsed, "
             "function list complete, no unresolved dependency calls",
         ]
+        if user_supplied_functions:
+            reasons.append("vulnerable functions: user-supplied (--vuln-functions override)")
         explanation = (
             f"Not reachable: {alert.package}@{alert.version} ({alert.advisory_id}) "
             f"-- no static call path from project code to the vulnerable function(s) "
             f"({target_names}), and no dynamic features that could hide one."
         )
+        if user_supplied_functions:
+            explanation += (
+                " Vulnerable functions: user-supplied (--vuln-functions override); "
+                "fix-commit confidence capped at manual."
+            )
         return self._verdict(
             alert,
             status="not_reachable",
@@ -281,22 +298,36 @@ class ReachabilityAnalyzer:
 
         return reasons, blockers
 
-    def _target_nodes(self, vulnerable_functions: list) -> tuple[list[CallNode], list[str]]:
+    def _target_nodes(
+        self, vulnerable_functions: list, user_supplied: bool = False
+    ) -> tuple[list[CallNode], list[str]]:
         """Map each :class:`VulnerableFunction` to its graph node.
 
         Returns ``(nodes, problems)``.  A target that does not map to exactly
         one node is a problem, never a silent miss.
+
+        When ``user_supplied`` is true (``--vuln-functions`` override) the
+        vulnerable function's file is unknown, so we match by qualified name
+        alone but still require exactly one graph node to avoid a silent miss.
         """
         nodes: list[CallNode] = []
         problems: list[str] = []
         seen: set[CallNode] = set()
         for vf in vulnerable_functions:
-            matches = [
-                node
-                for node in self.graph.nodes
-                if node.qualname == vf.qualified_name
-                and self._same_file(node.file, vf.file_path)
-            ]
+            target_file = vf.file_path
+            if user_supplied and not target_file:
+                # File unknown: match by qualified name only, uniquely.
+                matches = [
+                    node for node in self.graph.nodes
+                    if node.qualname == vf.qualified_name
+                ]
+            else:
+                matches = [
+                    node
+                    for node in self.graph.nodes
+                    if node.qualname == vf.qualified_name
+                    and self._same_file(node.file, vf.file_path)
+                ]
             if len(matches) == 1:
                 node = matches[0]
                 if node not in seen:
@@ -304,12 +335,12 @@ class ReachabilityAnalyzer:
                     nodes.append(node)
             elif not matches:
                 problems.append(
-                    f"target {vf.qualified_name!r} ({vf.file_path}) was not found "
+                    f"target {vf.qualified_name!r} ({vf.file_path or '<unknown>'}) was not found "
                     f"in the call graph"
                 )
             else:
                 problems.append(
-                    f"target {vf.qualified_name!r} ({vf.file_path}) is ambiguous: "
+                    f"target {vf.qualified_name!r} ({vf.file_path or '<unknown>'}) is ambiguous: "
                     f"{len(matches)} graph nodes match"
                 )
         return nodes, problems

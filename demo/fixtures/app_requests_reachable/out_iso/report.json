@@ -1,0 +1,42 @@
+{
+  "alerts": [
+    {
+      "package": "requests",
+      "version": "2.25.0",
+      "advisory_id": "GHSA-j8r2-6x86-q33q",
+      "aliases": [
+        "CVE-2023-32681",
+        "PYSEC-2023-74"
+      ]
+    }
+  ],
+  "fix_commits": [
+    {
+      "repo_url": null,
+      "sha": null,
+      "resolution_method": "not_found",
+      "confidence": 0.0
+    }
+  ],
+  "verdicts": [
+    {
+      "alert": {
+        "package": "requests",
+        "version": "2.25.0",
+        "advisory_id": "GHSA-j8r2-6x86-q33q",
+        "aliases": [
+          "CVE-2023-32681",
+          "PYSEC-2023-74"
+        ]
+      },
+      "status": "uncertain",
+      "confidence": "medium",
+      "call_path": [],
+      "reasons": [
+        "could not determine vulnerable functions from the fix commit"
+      ],
+      "dynamic_blockers": [],
+      "explanation": "Uncertain: the fix commit for requests@2.25.0 (GHSA-j8r2-6x86-q33q) did not yield any identifiable vulnerable function, so reachability cannot be ruled out."
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "urn:uuid:9d4cc645-0f16-1cab-1434-3c4b96e8eace",
+  "author": "vulnreach",
+  "timestamp": "2026-11-19T07:48:46Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "GHSA-j8r2-6x86-q33q"
+      },
+      "products": [
+        {
+          "@id": "pkg:pypi/app_requests_reachable@0.0.0",
+          "subcomponents": [
+            {
+              "@id": "pkg:pypi/requests@2.25.0"
+            }
+          ]
+        }
+      ],
+      "status": "affected",
+      "action_statement": "Upgrade requests from 2.25.0 to a patched version. Vulnerable code is reachable via: main.<module>@main.py:1 -> requests.sessions.SessionRedirectMixin.rebuild_proxies@/private/tmp/vr_e2e_venv/lib/python3.14/site-packages/requests/sessions.py:273",
+      "impact_statement": "main.<module>@main.py:1 -> requests.sessions.SessionRedirectMixin.rebuild_proxies@/private/tmp/vr_e2e_venv/lib/python3.14/site-packages/requests/sessions.py:273"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "urn:uuid:07db9213-5e7d-4c3f-a3e4-0e325e922bda",
+  "author": "vulnreach",
+  "timestamp": "2026-11-19T07:37:47Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": "GHSA-j8r2-6x86-q33q",
+      "products": [
+        "pkg:pypi/project@0.0.0"
+      ],
+      "subcomponents": [
+        "pkg:pypi/requests@2.25.0"
+      ],
+      "status": "under_investigation",
+      "status_notes": "dynamic features may hide a call path",
+      "impact_statement": "could not determine vulnerable functions from the fix commit"
+    }
+  ]
+}

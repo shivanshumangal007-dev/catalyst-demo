@@ -311,3 +311,9 @@ def seed_demo_verdicts() -> None:
             fix_commit=entry["fix_commit"],
             call_graph=entry["call_graph"],
         )
+
+
+# Seed demo verdicts on import so the chat UI has verdicts to discuss (the
+# "Send does nothing" bug: with an empty store, currentVerdictId stays null and
+# the form submit handler returns early).
+seed_demo_verdicts()

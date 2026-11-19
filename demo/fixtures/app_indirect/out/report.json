@@ -1,0 +1,52 @@
+{
+  "alerts": [
+    {
+      "package": "lib",
+      "version": "1.0.0",
+      "advisory_id": "A-1"
+    }
+  ],
+  "fix_commits": [
+    {
+      "repo_url": null,
+      "sha": null,
+      "resolution_method": "not_found",
+      "confidence": 0.0
+    }
+  ],
+  "verdicts": [
+    {
+      "alert": {
+        "package": "lib",
+        "version": "1.0.0",
+        "advisory_id": "A-1",
+        "aliases": []
+      },
+      "status": "reachable",
+      "confidence": "medium",
+      "call_path": [
+        {
+          "file": "main.py",
+          "line": 1,
+          "function": "main.<module>"
+        },
+        {
+          "file": "lib.py",
+          "line": 4,
+          "function": "lib.public_api"
+        },
+        {
+          "file": "lib.py",
+          "line": 1,
+          "function": "lib.vulnerable_function"
+        }
+      ],
+      "reasons": [
+        "call path from entry point main.<module> to vulnerable function lib.vulnerable_function",
+        "vulnerable functions: user-supplied (--vuln-functions override)"
+      ],
+      "dynamic_blockers": [],
+      "explanation": "Reachable: lib@1.0.0 (A-1) -- the vulnerable function lib.vulnerable_function is reachable from project code via a static call path starting at main.<module>. Vulnerable functions: user-supplied (--vuln-functions override); fix-commit confidence capped at manual."
+    }
+  ]
+}
