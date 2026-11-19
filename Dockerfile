@@ -4,9 +4,9 @@
 #
 # NOTE: Pin the base image digest by running:
 #   docker pull python:3.11-slim
-#   docker inspect --format='{{index .RepoDigests 0}}' python:3.11-slim
-# and replacing the placeholder sha256 below.
-FROM python:3.11-slim@sha256:0000000000000000000000000000000000000000000000000000000000000000
+#   docker inspect --format='{{join .RepoDigests ", "}}' python:3.11-slim
+# and replacing the sha256 below.
+FROM python@sha256:07d4824036af339fa1b6ef769cc99d9c10a141769538b52b3b597c84f7a7b535
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

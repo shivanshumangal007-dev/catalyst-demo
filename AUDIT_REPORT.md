@@ -302,7 +302,7 @@ broken. The README's isolation section, `--isolated` help text, and
 | F-26 | P1 | sandbox/docker_runner.py:113-123 | Container exit 1 on reachable is treated as failure | read | Accept exit code 1 as success and parse the report | **Fixed (Round 3)** |
 | F-27 | P1 | Dockerfile:4,13-21 | Base image not digest-pinned; project requirements never installed | read | Pin `python:3.11-slim@sha256:...`; build per-project image installing `--only-binary :all:` pinned deps | **Fixed (Round 3)** |
 | F-28 | P1 | Dockerfile:18 / .dockerignore absent | Build context copies `.git`, potential `.env`/secrets into image | read | Add `.dockerignore`; copy only needed files | **Fixed (Round 3)** |
-| F-29 | P1 | tests/test_docker_runner.py:24-63 | Test mocks `subprocess.run`, never verifies real isolation | read | Add a real Docker smoke test (behind a marker) | Open |
+| F-29 | P1 | tests/test_docker_runner.py:24-63 | Test mocks `subprocess.run`, never verifies real isolation | read | Add a real Docker smoke test (behind a marker) | **Fixed (Round 3)** |
 | F-30 | P1 | agent/pr_chat.py:148,154-181 | `llm_client` is stored but never called; pluggable LLM is dead code | grep `llm_client` | Call `self.llm_client.chat(...)` with evidence-only system prompt, or remove the claim | **Fixed (Round 3)** |
 | F-31 | P1 | agent/pr_chat.py:316-338 | Challenge needs function-like name; a bare filename does not re-run; `_find_target_node` accepts unrelated targets | Phase 6 | Accept `file:line`/file-only by resolving any node in that file; restrict target search to vulnerable functions or user-named graph nodes with an explicit note | **Fixed (Round 3)** |
 | F-32 | P1 | diffing/diff_to_functions.py:340-393 | `public_entry_points` computed but never used by the pipeline | grep `public_entry_points` | Feed these as additional vulnerable targets (public API) or use them to raise confidence | **Fixed (Round 2)** |
@@ -322,8 +322,8 @@ broken. The README's isolation section, `--isolated` help text, and
 | F-46 | P3 | cli.py:357-384 | `--no-cache` does not propagate into HTTP caches (same as F-24) | read | Pass a `NetworkCache(enabled=...)` | Open |
 | F-47 | P3 | models.py / analyzer.py | `list` untyped, `status: str` with `type: ignore`; not "full type hints" | read | Use `list[VulnerableFunction]`, `Literal` status type in helper signature | **Fixed (Round 3)** |
 | F-48 | P3 | app.py | No auth/rate limiting on `/chat`; unbounded message length | read | Add length limit; bind to localhost by default | **Fixed (Round 3)** |
-| F-49 | P3 | pyproject.toml | No `[project.optional-dependencies]` for `fastapi`/`uvicorn`; README says `pip install fastapi uvicorn` manually | read | Declare an `app` extra | Open |
-| F-50 | P3 | README.md:152-161,165-181 | Claims isolation installs project dependencies and that cached call graphs are reused; neither is true (F-27, F-06) | read + exec | Fix code or correct docs | Open |
+| F-49 | P3 | pyproject.toml | No `[project.optional-dependencies]` for `fastapi`/`uvicorn`; README says `pip install fastapi uvicorn` manually | read | Declare an `app` extra | **Fixed (Round 3)** |
+| F-50 | P3 | README.md:152-161,165-181 | Claims isolation installs project dependencies and that cached call graphs are reused; neither is true (F-27, F-06) | read + exec | Fix code or correct docs | **Fixed (Round 3)** |
 | F-51 | P0 | Dockerfile:27; sandbox/docker_runner.py:103-110 | `ENTRYPOINT ["vulnreach"]` plus argv `"vulnreach"` → `vulnreach vulnreach scan`; `--isolated` always exits 2 | `python3 -m vulnreach.cli scan … --isolated` | Remove the duplicated `"vulnreach"` from `run_cmd` (or add `--entrypoint`); add a real-Docker smoke test | **Fixed (Round 1)** |
 
 ---
