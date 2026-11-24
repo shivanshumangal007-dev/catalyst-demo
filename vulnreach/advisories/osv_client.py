@@ -13,6 +13,7 @@ are handled cleanly and return ``None``.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 import urllib.error
@@ -24,12 +25,15 @@ from typing import Any
 OSV_BASE = "https://api.osv.dev/v1"
 DEFAULT_TIMEOUT = 20
 
+logger = logging.getLogger("vulnreach.osv")
+
 
 class OSVClient:
     """Thin, cached client over the OSV REST API."""
 
-    def __init__(self, cache_db: str | Path | None = None, timeout: int = DEFAULT_TIMEOUT) -> None:
+    def __init__(self, cache_db: str | Path | None = None, timeout: int = DEFAULT_TIMEOUT, enabled: bool = True) -> None:
         self.timeout = timeout
+        self.enabled = enabled
         self.cache_db = Path(cache_db) if cache_db else Path.home() / ".cache" / "vulnreach" / "osv.sqlite"
         self.cache_db.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
@@ -49,6 +53,8 @@ class OSVClient:
     # ------------------------------------------------------------------ cache
 
     def _read_cache(self, key: str) -> dict[str, Any] | None:
+        if not self.enabled:
+            return None
         try:
             with sqlite3.connect(self.cache_db) as conn:
                 row = conn.execute(
@@ -61,6 +67,8 @@ class OSVClient:
             return None
 
     def _write_cache(self, key: str, data: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
         try:
             with sqlite3.connect(self.cache_db) as conn:
                 conn.execute(
@@ -73,7 +81,11 @@ class OSVClient:
     # ------------------------------------------------------------------ HTTP
 
     def _get(self, url: str) -> dict[str, Any] | None:
-        """GET a URL (with sqlite cache). Returns parsed JSON or None on miss/error/404."""
+        """GET a URL (with sqlite cache). Returns parsed JSON or None on miss/error/404.
+
+        Network and HTTP failures are logged as *errors* so they are never
+        silently mistaken for "no advisory exists" (not_found).
+        """
         cached = self._read_cache(url)
         if cached is not None:
             return cached
@@ -83,11 +95,14 @@ class OSVClient:
                 body = resp.read().decode("utf-8")
             data = json.loads(body)
             self._write_cache(url, data)
+            logger.info("OSV GET %s -> %s", url, resp.status)
             return data
-        except urllib.error.HTTPError:
-            # 404 and other HTTP errors: treat as "no advisory" rather than failing.
+        except urllib.error.HTTPError as exc:
+            # 404 means the advisory does not exist; other HTTP errors are real failures.
+            logger.error("OSV GET %s failed: HTTP %s", url, exc.code)
             return None
-        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+            logger.error("OSV GET %s failed: %s", url, exc)
             return None
 
     def _post(self, url: str, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -111,10 +126,13 @@ class OSVClient:
                 body = resp.read().decode("utf-8")
             result = json.loads(body)
             self._write_cache(cache_key, result)
+            logger.info("OSV POST %s -> %s", url, resp.status)
             return result
-        except urllib.error.HTTPError:
+        except urllib.error.HTTPError as exc:
+            logger.error("OSV POST %s failed: HTTP %s", url, exc.code)
             return None
-        except (urllib.error.URLError, OSError, json.JSONDecodeError):
+        except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+            logger.error("OSV POST %s failed: %s", url, exc)
             return None
 
     # ------------------------------------------------------------------ public API

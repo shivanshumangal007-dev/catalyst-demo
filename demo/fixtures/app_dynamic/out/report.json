@@ -1,0 +1,38 @@
+{
+  "alerts": [
+    {
+      "package": "lib",
+      "version": "1.0.0",
+      "advisory_id": "A-1"
+    }
+  ],
+  "fix_commits": [
+    {
+      "repo_url": null,
+      "sha": null,
+      "resolution_method": "not_found",
+      "confidence": 0.0
+    }
+  ],
+  "verdicts": [
+    {
+      "alert": {
+        "package": "lib",
+        "version": "1.0.0",
+        "advisory_id": "A-1",
+        "aliases": []
+      },
+      "status": "uncertain",
+      "confidence": "medium",
+      "call_path": [],
+      "reasons": [
+        "dynamic call sites are present",
+        "dynamic Python features could hide a reachable path"
+      ],
+      "dynamic_blockers": [
+        "/Users/shivanshumangal/Coding/Projects/catalyst-demo/demo/fixtures/app_dynamic/main.py:4 [getattr] getattr(obj, <non-literal>)"
+      ],
+      "explanation": "Uncertain: lib@1.0.0 (A-1) is not reachable via any static call path, but the analysis is incomplete: dynamic call sites are present; dynamic Python features could hide a reachable path. Dynamic features (getattr) in project or dependency code could conceal a path to the vulnerable function."
+    }
+  ]
+}

@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -28,6 +28,9 @@ app = FastAPI(title="VulnReach PR Chat", version="0.1.0")
 # In-memory store: verdict_id -> analysis context.
 # In production this would be backed by a database.
 _VERDICTS: dict[str, dict[str, Any]] = {}
+
+# Safety limits (F-48).
+MAX_MESSAGE_LENGTH = 4000
 
 
 class ChatRequest(BaseModel):
@@ -83,8 +86,18 @@ def list_verdicts() -> list[VerdictSummary]:
 
 
 @app.post("/chat")
-def chat(req: ChatRequest) -> JSONResponse:
-    """Reply to a user message about a verdict."""
+def chat(req: ChatRequest, request: Request) -> JSONResponse:
+    """Reply to a user message about a verdict.
+
+    Rate limiting and message-length limits are applied (F-48).
+    """
+    # Message-length limit.
+    if len(req.message) > MAX_MESSAGE_LENGTH:
+        raise HTTPException(
+            status_code=413,
+            detail=f"message too long: {len(req.message)} > {MAX_MESSAGE_LENGTH} characters",
+        )
+
     entry = _VERDICTS.get(req.verdict_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"verdict {req.verdict_id} not found")
@@ -230,6 +243,77 @@ loadVerdicts();
 
 
 def seed_demo_verdicts() -> None:
-    """Seed the store with the demo scenario verdicts (called on import)."""
-    # This is intentionally a no-op here; the demo script populates the store.
-    pass
+    """Seed the store with demo scenario verdicts derived from the analyzer.
+
+    Builds the three synthetic fixture apps (reachable, not_reachable, dynamic)
+    through the real analyzer pipeline so verdicts reflect actual analysis
+    results, not hand-written text (F-41).
+    """
+    from pathlib import Path
+
+    from vulnreach.advisories.fix_commit import FixCommit
+    from vulnreach.callgraph.builder import CallGraphBuilder
+    from vulnreach.models import Alert, VulnerableFunction
+    from vulnreach.reachability.analyzer import ReachabilityAnalyzer
+
+    FIXTURES = Path(__file__).resolve().parent / "demo" / "fixtures"
+
+    DIRECT_LINK = FixCommit(
+        repo_url="https://github.com/owner/lib",
+        sha="a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0",
+        resolution_method="direct_link",
+        confidence=0.95,
+    )
+    PR_REF = FixCommit(
+        repo_url="https://github.com/owner/lib",
+        sha="b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1",
+        resolution_method="pr_reference",
+        confidence=0.7,
+    )
+
+    def _build(app_name: str, vf_qual: str, vf_file: str, fix_commit: FixCommit,
+               advisory_id: str) -> dict[str, Any]:
+        project = FIXTURES / app_name
+        builder = CallGraphBuilder(project)
+        call_graph = builder.build()
+        analyzer = ReachabilityAnalyzer(call_graph, project)
+        vuln_funcs = [VulnerableFunction(
+            module="lib", qualified_name=vf_qual, file_path=vf_file, confidence=0.95
+        )]
+        alert = Alert(package="lib", version="1.0.0", advisory_id=advisory_id, aliases=[])
+        verdict = analyzer.analyze_alert(alert, vuln_funcs, False, fix_commit)
+        return {
+            "verdict": verdict,
+            "analyzer": analyzer,
+            "project_path": str(project),
+            "alert": alert,
+            "vulnerable_functions": vuln_funcs,
+            "fix_commit": fix_commit,
+            "call_graph": call_graph,
+        }
+
+    scenario = [
+        ("app_reachable", "lib.vulnerable_function", "lib.py", DIRECT_LINK, "DEMO-REACHABLE-1"),
+        ("app_not_reachable", "lib.vulnerable_function", "lib.py", DIRECT_LINK, "DEMO-SAFE-1"),
+        ("app_dynamic", "lib.vulnerable_function", "lib.py", PR_REF, "DEMO-DYNAMIC-1"),
+    ]
+
+    for app_name, vf_qual, vf_file, fix_commit, advisory_id in scenario:
+        entry = _build(app_name, vf_qual, vf_file, fix_commit, advisory_id)
+        vid = str(uuid.uuid4())
+        _register_verdict(
+            verdict_id=vid,
+            verdict=entry["verdict"],
+            analyzer=entry["analyzer"],
+            project_path=entry["project_path"],
+            alert=entry["alert"],
+            vulnerable_functions=entry["vulnerable_functions"],
+            fix_commit=entry["fix_commit"],
+            call_graph=entry["call_graph"],
+        )
+
+
+# Seed demo verdicts on import so the chat UI has verdicts to discuss (the
+# "Send does nothing" bug: with an empty store, currentVerdictId stays null and
+# the form submit handler returns early).
+seed_demo_verdicts()

@@ -30,7 +30,7 @@ from vulnreach.models import VulnerableFunction
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 COMMIT_DIFF_RE = re.compile(r"github.com/([^/]+)/([^/]+?)(?:\.git)?/commit/([0-9a-fA-F]{5,40})")
-MODULE_RE = re.compile(r"github.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
+MODULE_RE = re.compile(r"^https?://github.com/([^/]+)/([^/]+?)(?:\.git)?/?$")
 
 # File name / path signals that a change should be ignored entirely.
 IGNORED_DIRS = {
@@ -164,6 +164,7 @@ class DiffToFunctions:
             return []
 
         results: dict[str, VulnerableFunction] = {}
+        analysable_file_seen = False
 
         for patched_file in patch_set:
             path = self._clean_path(patched_file.target_file or patched_file.source_file or "")
@@ -175,57 +176,58 @@ class DiffToFunctions:
                 continue
             old_text = old_contents.get(path)
             if old_text is None:
+                # A changed Python file we cannot inspect could contain the
+                # vulnerable function; never silently drop it.
+                self.functions_unknown = True
                 continue
-            module = self._module_from_path(path)
 
             try:
                 tree = ast_parse(old_text)
             except SyntaxError:
+                self.functions_unknown = True
                 continue
 
+            analysable_file_seen = True
+            module = self._module_from_path(path)
             funcs = self._collect_functions(tree, module)
-            # Map line -> innermost enclosing function for caller detection.
-            line_to_func = self._line_to_func_map(funcs)
 
             # Per-function change tracking.
             changes: dict[str, dict[str, Any]] = {}
 
             for hunk in patched_file:
+                # Added lines do not exist in the pre-fix file.  Anchor them to
+                # the nearest old-file line (previous context/removed line, or
+                # the hunk's old start) so the enclosing pre-fix function can
+                # still be found.
+                last_old_lineno: int | None = None
                 for line in hunk:
-                    if not line.is_removed:
-                        continue
-                    old_lineno = line.source_line_no
-                    if old_lineno is None:
-                        continue
-                    info = self._enclosing_function(funcs, old_lineno)
-                    if info is None:
-                        qualname = f"{module}.<module>"
-                        is_private = False
+                    if line.is_removed:
+                        old_lineno = line.source_line_no
+                        if old_lineno is not None:
+                            self._record_change(
+                                changes, module, path, funcs, old_lineno, line.value
+                            )
+                        last_old_lineno = old_lineno
+                    elif line.is_added:
+                        anchor = (
+                            last_old_lineno
+                            if last_old_lineno is not None
+                            else hunk.source_start
+                        )
+                        if anchor:
+                            self._record_change(
+                                changes, module, path, funcs, anchor, line.value
+                            )
                     else:
-                        qualname = info.qualname
-                        is_private = info.is_private
-
-                    entry = changes.setdefault(
-                        qualname,
-                        {
-                            "qualname": qualname,
-                            "file_path": path,
-                            "is_private": is_private,
-                            "module": module,
-                            "lines": set(),
-                            "formatting_lines": 0,
-                        },
-                    )
-                    entry["lines"].add(old_lineno)
-                    if self._is_formatting_line(line.value):
-                        entry["formatting_lines"] += 1
+                        if line.source_line_no is not None:
+                            last_old_lineno = line.source_line_no
 
             for qualname, data in changes.items():
                 conf = self._compute_confidence(
                     commit_confidence,
                     data["is_private"],
                     data["lines"],
-                    data["formatting_lines"],
+                    len(data["formatting_lines"]),
                     advisory_text,
                     data["qualname"],
                 )
@@ -237,6 +239,11 @@ class DiffToFunctions:
                 )
                 results[qualname] = vf
 
+        if analysable_file_seen and not results:
+            # We had pre-fix files to inspect but mapped no changed line to a
+            # function.  Treat the function list as unknown rather than safe.
+            self.functions_unknown = True
+
         # Public entry points: public functions that directly call a changed
         # private function (one level up), in the same pre-fix file.
         self.public_entry_points = self._find_entry_points(
@@ -244,6 +251,39 @@ class DiffToFunctions:
         )
 
         return list(results.values())
+
+    def _record_change(
+        self,
+        changes: dict[str, dict[str, Any]],
+        module: str,
+        path: str,
+        funcs: list[_FuncInfo],
+        old_lineno: int,
+        line_value: str,
+    ) -> None:
+        """Attribute one changed line to its innermost pre-fix function."""
+        info = self._enclosing_function(funcs, old_lineno)
+        if info is None:
+            qualname = f"{module}.<module>"
+            is_private = False
+        else:
+            qualname = info.qualname
+            is_private = info.is_private
+
+        entry = changes.setdefault(
+            qualname,
+            {
+                "qualname": qualname,
+                "file_path": path,
+                "is_private": is_private,
+                "module": module,
+                "lines": set(),
+                "formatting_lines": set(),
+            },
+        )
+        entry["lines"].add(old_lineno)
+        if self._is_formatting_line(line_value):
+            entry["formatting_lines"].add(old_lineno)
 
     # ------------------------------------------------------------------ AST walking
 

@@ -1,0 +1,38 @@
+{
+  "alerts": [
+    {
+      "package": "lib",
+      "version": "1.0.0",
+      "advisory_id": "A-1"
+    }
+  ],
+  "fix_commits": [
+    {
+      "repo_url": null,
+      "sha": null,
+      "resolution_method": "not_found",
+      "confidence": 0.0
+    }
+  ],
+  "verdicts": [
+    {
+      "alert": {
+        "package": "lib",
+        "version": "1.0.0",
+        "advisory_id": "A-1",
+        "aliases": []
+      },
+      "status": "not_reachable",
+      "confidence": "medium",
+      "call_path": [],
+      "reasons": [
+        "no static call path from any entry point to the vulnerable function",
+        "no dynamic features that could conceal a path",
+        "positive-evidence gate passed: targets found, all files parsed, function list complete, no unresolved dependency calls",
+        "vulnerable functions: user-supplied (--vuln-functions override)"
+      ],
+      "dynamic_blockers": [],
+      "explanation": "Not reachable: lib@1.0.0 (A-1) -- no static call path from project code to the vulnerable function(s) (lib.vulnerable_function), and no dynamic features that could hide one. Vulnerable functions: user-supplied (--vuln-functions override); fix-commit confidence capped at manual."
+    }
+  ]
+}

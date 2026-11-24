@@ -100,7 +100,6 @@ class DockerRunner:
             "-w",
             self.container_workdir,
             self.image,
-            "vulnreach",
             "scan",
             container_project,
             "--alerts",
@@ -116,7 +115,11 @@ class DockerRunner:
             text=True,
             timeout=self.timeout + 30,
         )
-        if result.returncode != 0:
+        # Exit code 1 from the container means VulnReach found a reachable
+        # vulnerability (the CLI returns 1 for reachable).  That is a valid,
+        # successful analysis result — not a runner failure.  Only non-zero
+        # exit codes other than 1 indicate a real problem (crash, misuse, etc.).
+        if result.returncode not in (0, 1):
             raise RuntimeError(
                 f"isolated analysis failed (exit {result.returncode}):\n"
                 f"stdout: {result.stdout}\nstderr: {result.stderr}"

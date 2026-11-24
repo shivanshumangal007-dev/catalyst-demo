@@ -1,10 +1,10 @@
 """Synthetic PR scenario for the VulnReach PR chat agent demo.
 
-Three fixture apps produce three verdicts:
+Three fixture apps produce three verdicts derived from the real analyzer:
 
-* ``demo/reachable``  - calls the vulnerable function directly  → reachable
-* ``demo/safe``       - imports the package but only uses safe functions → not_reachable
-* ``demo/dynamic``    - uses getattr(lib, name) with a config-driven name → uncertain
+* ``demo/fixtures/app_reachable``  - calls the vulnerable function directly  → reachable
+* ``demo/fixtures/app_not_reachable`` - imports the package but only uses safe functions → not_reachable
+* ``demo/fixtures/app_dynamic``    - uses getattr(lib, name) with a config-driven name → uncertain
 
 Run the scripted conversation:
 
@@ -13,12 +13,11 @@ Run the scripted conversation:
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 from vulnreach.advisories.fix_commit import FixCommit
 from vulnreach.callgraph.builder import CallGraphBuilder
-from vulnreach.models import Alert, PathHop, Verdict
+from vulnreach.models import Alert, VulnerableFunction
 from vulnreach.reachability.analyzer import ReachabilityAnalyzer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -37,38 +36,31 @@ PR_REF = FixCommit(
 )
 
 
-def _build_context(app_name: str):
-    """Build the analyzer context (graph + entry points) for a fixture app."""
+def _build(app_name: str, fix_commit: FixCommit, advisory_id: str) -> dict:
+    """Build a scenario entry by running the real analyzer on a fixture app.
+
+    Verdicts are derived from `analyzer.analyze_alert()`, not hard-coded
+    (F-41).
+    """
     project = FIXTURES / app_name
     builder = CallGraphBuilder(project)
     call_graph = builder.build()
     analyzer = ReachabilityAnalyzer(call_graph, project)
-    return project, analyzer, call_graph
-
-
-def _make_verdict(
-    *,
-    package: str,
-    version: str,
-    advisory_id: str,
-    status: str,
-    confidence: str,
-    call_path: list[PathHop] | None = None,
-    reasons: list[str] | None = None,
-    dynamic_blockers: list[str] | None = None,
-    explanation: str = "",
-    fix_commit: FixCommit,
-) -> Verdict:
-    alert = Alert(package=package, version=version, advisory_id=advisory_id, aliases=[])
-    return Verdict(
-        alert=alert,
-        status=status,  # type: ignore[arg-type]
-        confidence=confidence,  # type: ignore[arg-type]
-        call_path=call_path or [],
-        reasons=reasons or [],
-        dynamic_blockers=dynamic_blockers or [],
-        explanation=explanation,
-    )
+    vuln_funcs = [VulnerableFunction(
+        module="lib", qualified_name="lib.vulnerable_function",
+        file_path="lib.py", confidence=0.95
+    )]
+    alert = Alert(package="lib", version="1.0.0", advisory_id=advisory_id, aliases=[])
+    verdict = analyzer.analyze_alert(alert, vuln_funcs, False, fix_commit)
+    return {
+        "verdict": verdict,
+        "analyzer": analyzer,
+        "project_path": str(project),
+        "alert": alert,
+        "vulnerable_functions": vuln_funcs,
+        "fix_commit": fix_commit,
+        "call_graph": call_graph,
+    }
 
 
 def build_scenario() -> dict[str, dict]:
@@ -76,94 +68,12 @@ def build_scenario() -> dict[str, dict]:
     scenario: dict[str, dict] = {}
 
     # ---- 1. reachable: app_reachable calls lib.vulnerable_function directly.
-    project, analyzer, call_graph = _build_context("app_reachable")
-    reachable_path = [
-        PathHop(file="main.py", line=3, function="app_reachable.main.<module>"),
-        PathHop(file="lib.py", line=1, function="lib.vulnerable_function"),
-    ]
-    scenario["reachable"] = {
-        "verdict": _make_verdict(
-            package="lib",
-            version="1.0.0",
-            advisory_id="DEMO-REACHABLE-1",
-            status="reachable",
-            confidence="high",
-            call_path=reachable_path,
-            reasons=[
-                "Static call path from main.py:3 to lib.vulnerable_function@lib.py:1",
-            ],
-            dynamic_blockers=[],
-            explanation=(
-                "Reachable: lib@1.0.0 (DEMO-REACHABLE-1) — the vulnerable function "
-                "lib.vulnerable_function is reachable from project code via main.py:3."
-            ),
-            fix_commit=DIRECT_LINK,
-        ),
-        "analyzer": analyzer,
-        "project_path": str(project),
-        "alert": Alert(package="lib", version="1.0.0", advisory_id="DEMO-REACHABLE-1"),
-        "vulnerable_functions": [],
-        "fix_commit": DIRECT_LINK,
-        "call_graph": call_graph,
-    }
+    scenario["reachable"] = _build("app_reachable", DIRECT_LINK, "DEMO-REACHABLE-1")
 
     # ---- 2. not_reachable: app_not_reachable imports lib but only uses safe_function.
-    project, analyzer, call_graph = _build_context("app_not_reachable")
-    scenario["not_reachable"] = {
-        "verdict": _make_verdict(
-            package="lib",
-            version="1.0.0",
-            advisory_id="DEMO-SAFE-1",
-            status="not_reachable",
-            confidence="high",
-            reasons=[
-                "No static call path from any entry point to lib.vulnerable_function",
-                "No dynamic features that could conceal a path",
-            ],
-            dynamic_blockers=[],
-            explanation=(
-                "Not reachable: lib@1.0.0 (DEMO-SAFE-1) — no static call path from "
-                "project code to lib.vulnerable_function, and no dynamic features."
-            ),
-            fix_commit=DIRECT_LINK,
-        ),
-        "analyzer": analyzer,
-        "project_path": str(project),
-        "alert": Alert(package="lib", version="1.0.0", advisory_id="DEMO-SAFE-1"),
-        "vulnerable_functions": [],
-        "fix_commit": DIRECT_LINK,
-        "call_graph": call_graph,
-    }
+    scenario["not_reachable"] = _build("app_not_reachable", DIRECT_LINK, "DEMO-SAFE-1")
 
     # ---- 3. uncertain: app_dynamic uses getattr(lib, name) with config-driven name.
-    project, analyzer, call_graph = _build_context("app_dynamic")
-    scenario["uncertain"] = {
-        "verdict": _make_verdict(
-            package="lib",
-            version="1.0.0",
-            advisory_id="DEMO-DYNAMIC-1",
-            status="uncertain",
-            confidence="medium",
-            reasons=[
-                "No static call path from any entry point to lib.vulnerable_function",
-                "Dynamic Python features could hide a reachable path",
-            ],
-            dynamic_blockers=[
-                "main.py:5 [getattr] getattr(lib, <non-literal>)"
-            ],
-            explanation=(
-                "Uncertain: lib@1.0.0 (DEMO-DYNAMIC-1) is not reachable via any static "
-                "call path, but getattr(lib, name) with a non-literal name could conceal "
-                "a path to lib.vulnerable_function."
-            ),
-            fix_commit=PR_REF,
-        ),
-        "analyzer": analyzer,
-        "project_path": str(project),
-        "alert": Alert(package="lib", version="1.0.0", advisory_id="DEMO-DYNAMIC-1"),
-        "vulnerable_functions": [],
-        "fix_commit": PR_REF,
-        "call_graph": call_graph,
-    }
+    scenario["uncertain"] = _build("app_dynamic", PR_REF, "DEMO-DYNAMIC-1")
 
     return scenario

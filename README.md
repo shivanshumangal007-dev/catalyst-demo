@@ -129,7 +129,7 @@ Implement `LLMClient.chat(messages)` to wire up your own model endpoint.
 ### FastAPI app
 
 ```bash
-pip install fastapi uvicorn
+pip install -e ".[app]"
 uvicorn app:app --reload
 ```
 
@@ -166,8 +166,8 @@ When `--isolated` is passed, `vulnreach scan` runs the entire analysis inside a
 Docker container (`vulnreach/sandbox/docker_runner.py`):
 
 1. **Image build (network on)** — an image is built from `Dockerfile`, which
-   installs the project's pinned dependencies from its requirements. Network is
-   available only during this build step.
+   installs VulnReach and its dependencies. Network is available only during
+   this build step.
 2. **Analysis run (network off)** — the container runs `vulnreach scan` with
    `--network none`, so no network is available during analysis.
 3. **Read-only project mount** — the target project is mounted read-only
@@ -178,7 +178,8 @@ Docker container (`vulnreach/sandbox/docker_runner.py`):
 6. **Static analysis only** — the target project's code is **never imported or
    executed**. VulnReach parses it with `ast` to build a call graph and assess
    reachability. The container executes only VulnReach itself, never the
-   project under analysis.
+   project under analysis. VulnReach does not need the project's dependencies
+   installed because it never imports them.
 
 ```bash
 vulnreach scan ./myproject --alerts alerts.json --out-dir out/ --isolated
@@ -252,8 +253,9 @@ stored. Cache hits are logged. `--no-cache` disables the store entirely.
 * **Over-approximation**: unresolved calls add edges to all functions with a
   matching name, which can produce false positives (reachable when it's not).
   These edges are flagged and downgrade confidence to `medium`.
-* **Single vulnerable package**: the CLI's cached dependency call graph is
-  keyed on the first alert's package; multi-package projects re-run per alert.
+* **Multi-package scans**: the call graph includes ALL alert dependency packages,
+  so every alert's vulnerable functions are resolved against the same graph
+  (no package is silently omitted).
 
 ## Project layout
 

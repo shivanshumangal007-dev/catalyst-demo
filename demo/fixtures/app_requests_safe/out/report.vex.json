@@ -1,0 +1,27 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "urn:uuid:9c85ef38-2f96-3556-0ee8-d0c1a0194bc5",
+  "author": "vulnreach",
+  "timestamp": "2026-11-19T07:48:47Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "GHSA-j8r2-6x86-q33q"
+      },
+      "products": [
+        {
+          "@id": "pkg:pypi/app_requests_safe@0.0.0",
+          "subcomponents": [
+            {
+              "@id": "pkg:pypi/requests@2.25.0"
+            }
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "no static call path from any entry point to the vulnerable function; no dynamic features that could conceal a path; positive-evidence gate passed: targets found, all files parsed, function list complete, no unresolved dependency calls"
+    }
+  ]
+}

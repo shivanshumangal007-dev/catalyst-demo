@@ -1,7 +1,12 @@
 # VulnReach tool image.
 # Analysis is static-only (ast-based): the target project's code is never
 # imported or executed, only parsed.
-FROM python:3.11-slim
+#
+# NOTE: Pin the base image digest by running:
+#   docker pull python:3.11-slim
+#   docker inspect --format='{{join .RepoDigests ", "}}' python:3.11-slim
+# and replacing the sha256 below.
+FROM python@sha256:07d4824036af339fa1b6ef769cc99d9c10a141769538b52b3b597c84f7a7b535
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

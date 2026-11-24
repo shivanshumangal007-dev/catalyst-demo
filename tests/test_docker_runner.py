@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -19,6 +20,27 @@ class _FakeCompleted:
         self.returncode = returncode
         self.stdout = stdout
         self.stderr = stderr
+
+
+def _docker_available() -> bool:
+    """Return True only if the docker CLI exists AND the daemon responds."""
+    if shutil.which("docker") is None:
+        return False
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=5
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+# Skip real-Docker tests unless the Docker daemon is reachable.
+docker_available = pytest.mark.skipif(
+    not _docker_available(), reason="Docker daemon not available"
+)
 
 
 def test_run_isolated_uses_network_none_and_readonly_project(tmp_path):
@@ -71,7 +93,7 @@ def test_run_isolated_raises_on_failure(tmp_path):
 
     def fake_run(cmd, **kwargs):
         if cmd[1] == "run":
-            return _FakeCompleted(returncode=1, stdout="", stderr="boom")
+            return _FakeCompleted(returncode=2, stdout="", stderr="boom")
         return _FakeCompleted(returncode=0)
 
     runner = _make_runner()
@@ -86,3 +108,40 @@ def test_docker_not_found(tmp_path, monkeypatch):
     monkeypatch.setattr(shutil, "which", lambda _: None)
     with pytest.raises(RuntimeError, match="docker executable not found"):
         DockerRunner()
+
+
+@docker_available
+def test_real_docker_smoke(tmp_path):
+    """Real Docker smoke test: build the VulnReach image and run analysis.
+
+    This test actually builds the Docker image and runs the analysis container
+    against a tiny fixture project.  It is skipped unless the Docker daemon is
+    reachable (F-29).
+    """
+    import json
+    import subprocess
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "main.py").write_text("print('hello')\n")
+    alerts = tmp_path / "alerts.json"
+    alerts.write_text(
+        json.dumps([{"package": "nonexistent-pkg", "version": "0.0.0", "advisory_id": "TEST-1"}])
+    )
+    out_dir = tmp_path / "out"
+
+    runner = DockerRunner(image="vulnreach:audit-smoke", timeout=300, mem_limit="1g", cpus="1")
+
+    # Build the image from the repo Dockerfile.
+    dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile"
+    build = subprocess.run(
+        ["docker", "build", "-t", "vulnreach:audit-smoke", "-f", str(dockerfile), str(dockerfile.parent)],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert build.returncode == 0, f"docker build failed: {build.stderr}"
+
+    # Run the analysis (network disabled, read-only project).
+    result = runner.run_isolated(project, alerts, out_dir)
+    assert "verdicts" in result

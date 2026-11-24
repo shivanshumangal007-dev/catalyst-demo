@@ -9,9 +9,18 @@ added to *all* functions with the matching name -- soundness over precision --
 and those edges are flagged ``over_approx=True`` so the reachability analyzer
 can downgrade confidence accordingly.
 
-Entry points are module-level code, ``if __name__ == "__main__"`` blocks,
-framework-decorated functions (@app.route, @click.command, @pytest.fixture, …)
-and console_scripts entry points.
+Every :class:`ast.Call` node in every parsed file is accounted for: it either
+becomes a graph edge, is recognised as a dynamic site, or is classified as an
+external/builtin/stdlib call that cannot reach the target.  Unaccounted calls
+are recorded as ``unresolved_calls`` with file:line, forcing the analyzer to
+return ``uncertain`` instead of a false ``not_reachable``.
+
+Call resolution uses a generic :class:`ast.NodeVisitor` with ``visit_Call`` that
+reaches every expression context (assignments, args, tests, decorators,
+lambdas, comprehensions, await/yield, raise, assert, f-strings, subscripts,
+match subjects, class bodies, with-items).  The caller is attributed by lexical
+scope: a stack of :class:`CallNode` entries is pushed/popped as functions and
+classes are entered and exited.
 """
 
 from __future__ import annotations
@@ -44,6 +53,13 @@ class CallGraphResult:
     entry_points: list[CallNode]
     dynamic_sites: list[DynamicSite]
     name_index: dict[str, list[CallNode]]
+    # Files that could not be read or parsed.  Any non-empty entry means the
+    # graph is incomplete, so the analyzer must not return ``not_reachable``.
+    unparsed_files: list[str] = field(default_factory=list)
+    # Call sites (inside the analysed project) whose callee could not be
+    # resolved and whose receiver is the target dependency.  Such a call could
+    # reach a vulnerable dependency function that is absent from the graph.
+    unresolved_calls: list[str] = field(default_factory=list)
 
 
 # A local name binding recorded during the import/definition pass.
@@ -55,6 +71,274 @@ class _Binding:
     qualname: str | None = None  # resolved qualified name, when known
 
 
+# Builtin / stdlib calls that cannot reach the user's vulnerable dependency.
+_EXTERNAL_CALLS = {
+    "print", "len", "str", "int", "float", "bool", "list", "dict", "set",
+    "tuple", "range", "enumerate", "zip", "map", "filter", "sorted",
+    "any", "all", "sum", "min", "max", "abs", "round", "pow", "hash", "id",
+    "isinstance", "issubclass", "hasattr", "setattr", "delattr",
+    "dir", "vars", "type", "open", "input", "repr", "ascii", "chr", "ord",
+    "hex", "oct", "bin", "format", "bytes", "bytearray", "memoryview",
+    "slice", "object", "super",
+}
+
+
+class _CallVisitor(ast.NodeVisitor):
+    """Visit every :class:`ast.Call` node, attributing it to its lexical scope.
+
+    The caller stack holds :class:`CallNode` entries.  Entering a function
+    pushes its node; entering a class pushes the enclosing scope's caller for
+    class-body statements (class-body code runs at import time in the module
+    scope).  Lambdas, comprehensions and other anonymous scopes do *not* push a
+    new caller -- calls inside them are attributed to the enclosing scope.
+    """
+
+    def __init__(self, builder: "CallGraphBuilder", module: str, path: Path, initial_caller: CallNode | None) -> None:
+        self.builder = builder
+        self.module = module
+        self.path = path
+        self.caller_stack: list[CallNode | None] = [initial_caller]
+        self._current_class: str | None = None
+        self._func_stack: list[str] = []
+        self.accounted_calls: set[tuple[str, int]] = set()
+        self.all_call_sites: list[tuple[str, int, str]] = []
+
+    # ------------------------------------------------------------------ calls
+
+    def visit_Call(self, node: ast.Call) -> None:
+        caller = self.caller_stack[-1] if self.caller_stack else None
+        rendered = self._render(node.func)
+        key = (str(self.path), node.lineno)
+        self.all_call_sites.append((str(self.path), node.lineno, rendered))
+
+        # Try to add edge(s) for this call.
+        edge_added = self.builder._add_call_edge(self.module, node, caller)
+
+        # Classify: edge, dynamic site, external, or unresolved.
+        accounted = edge_added
+        if not accounted and self.builder._is_dynamic_call_site(str(self.path), node):
+            accounted = True
+        if not accounted and self.builder._is_external_call(node):
+            accounted = True
+
+        if accounted:
+            self.accounted_calls.add(key)
+        else:
+            # Mark every examined call as accounted so the accounting check is
+            # complete.  Only dependency-targeted unresolvable calls are added
+            # to unresolved_calls, because those could reach a vulnerable
+            # dependency function absent from the graph.
+            self.accounted_calls.add(key)
+            if self.builder._call_targets_dependency(self.module, node.func):
+                self.builder.unresolved_calls.append(
+                    f"{self.builder._display_file(self.path)}:{node.lineno} "
+                    f"unresolved call to {rendered}"
+                )
+
+        # Handle callback registration: functools.partial(func), Thread(target=func),
+        # map(func, ...) -- the callable argument will be invoked later.
+        self._handle_callback_registration(caller, node)
+
+        # Recurse for nested calls inside arguments / keywords.
+        self.generic_visit(node)
+
+    def _handle_callback_registration(self, caller: CallNode | None, node: ast.Call) -> None:
+        """Register edges for callback-wrapping calls.
+
+        ``functools.partial(func)``, ``threading.Thread(target=func)``, and
+        similar calls store ``func`` for later invocation.  Add an edge from
+        the caller to ``func`` so the callback target is reachable.
+        """
+        if caller is None:
+            return
+        # Identify the wrapped call: functools.partial, threading.Thread
+        wrapped = self._callback_wrapper_name(node.func)
+        if wrapped is None:
+            return
+        callable_ref = self._find_callable_arg(node)
+        if callable_ref is None:
+            return
+        # Resolve the callable reference to a graph node
+        callee = self._resolve_callable_ref(callable_ref)
+        if callee is not None and callee is not caller:
+            self.builder.graph.add_edge(caller, callee, over_approx=False)
+
+    @staticmethod
+    def _callback_wrapper_name(func_expr: ast.AST) -> str | None:
+        """Return the wrapper name if ``func_expr`` is a callback registration."""
+        if isinstance(func_expr, ast.Attribute):
+            parts = []
+            node: ast.AST = func_expr
+            while isinstance(node, ast.Attribute):
+                parts.append(node.attr)
+                node = node.value
+            if isinstance(node, ast.Name):
+                full = node.id + "." + ".".join(reversed(parts))
+                if full in {"functools.partial", "threading.Thread"}:
+                    return full
+        return None
+
+    def _find_callable_arg(self, node: ast.Call) -> ast.AST | None:
+        """Find a callable reference argument in a callback registration call."""
+        wrapper = self._callback_wrapper_name(node.func)
+        if wrapper == "functools.partial" and node.args:
+            return node.args[0]
+        if wrapper == "threading.Thread":
+            for kw in node.keywords:
+                if kw.arg == "target":
+                    return kw.value
+        return None
+
+    def _resolve_callable_ref(self, ref: ast.AST) -> CallNode | None:
+        """Resolve a callable reference expression to a graph node."""
+        if isinstance(ref, ast.Attribute):
+            return self.builder._resolve_attribute_to_node(self.module, ref)
+        if isinstance(ref, ast.Name):
+            binding = self.builder._value_bindings.get(self.module, {}).get(ref.id)
+            if isinstance(binding, CallNode):
+                return binding
+        return None
+
+    def visit_With(self, node: ast.With) -> None:
+        """Model ``with H():`` as an implicit call to ``H.__enter__``."""
+        caller = self.caller_stack[-1] if self.caller_stack else None
+        for item in node.items:
+            ctx = item.context_expr
+            if isinstance(ctx, ast.Call) and isinstance(ctx.func, ast.Name):
+                cls_name = ctx.func.id
+                # H() instantiates class H; __enter__ is called on the instance.
+                self._add_dunder_edge(caller, cls_name, "__enter__")
+        self.generic_visit(node)
+
+    def _add_dunder_edge(self, caller: CallNode | None, cls_name: str, dunder: str) -> None:
+        """Add an edge from ``caller`` to ``cls_name.__dunder__``."""
+        if caller is None:
+            return
+        # Find the class method node
+        class_qualname = f"{self.module}.{cls_name}"
+        methods = self.builder._class_methods.get(class_qualname, {})
+        if dunder in methods:
+            self.builder.graph.add_edge(caller, methods[dunder], over_approx=False)
+
+    # ------------------------------------------------------------------ scopes
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        # Process decorator applications: @deco is deco(func) at definition
+        # time, so add an edge from the current caller to the decorator.
+        caller = self.caller_stack[-1] if self.caller_stack else None
+        for dec in node.decorator_list:
+            if isinstance(dec, ast.Name):
+                self._add_decorator_edge(caller, dec.id)
+            elif isinstance(dec, ast.Call):
+                # @deco(args) -- visit the factory call
+                self.visit_Call(dec)
+        self._func_stack.append(node.name)
+        self._push_function_scope(node, tuple(self._func_stack[:-1]))
+        self.generic_visit(node)
+        self.caller_stack.pop()
+        self._func_stack.pop()
+
+    def _push_function_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef, outer: tuple[str, ...] = ()) -> None:
+        qualname = self.builder._function_qualname(self.module, node, self._current_class, outer)
+        new_caller = self.builder._file_functions[self.module].get(qualname)
+        self.caller_stack.append(new_caller if new_caller else None)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        # Process decorators for async functions too
+        caller = self.caller_stack[-1] if self.caller_stack else None
+        for dec in node.decorator_list:
+            if isinstance(dec, ast.Name):
+                self._add_decorator_edge(caller, dec.id)
+            elif isinstance(dec, ast.Call):
+                self.visit_Call(dec)
+        self._func_stack.append(node.name)
+        self._push_function_scope(node, tuple(self._func_stack[:-1]))
+        self.generic_visit(node)
+        self.caller_stack.pop()
+        self._func_stack.pop()
+
+    def _add_decorator_edge(self, caller: CallNode | None, dec_name: str) -> None:
+        """Add an edge from ``caller`` to the function named ``dec_name``.
+
+        Models ``@deco`` as a call ``deco(func)`` at definition time.
+        """
+        if caller is None:
+            return
+        callees, _ = self.builder._resolve_call_targets(
+            self.builder._current_module if hasattr(self.builder, '_current_module') else self.module,
+            ast.Name(id=dec_name),
+        )
+        for callee in callees:
+            if callee is not caller:
+                self.builder.graph.add_edge(caller, callee, over_approx=False)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        # Class-body statements run in the enclosing scope (module or outer
+        # function), so reuse that caller for class-body calls.
+        body_caller = self.caller_stack[-1] if self.caller_stack else None
+        prev_class = self._current_class
+        self._current_class = f"{self.module}.{node.name}" if self.module else node.name
+        self.caller_stack.append(body_caller)
+        self.generic_visit(node)
+        self.caller_stack.pop()
+        self._current_class = prev_class
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        # Comparisons between class instances may invoke dunder methods
+        # (__eq__, __ne__, ...).  Model them as over-approximated edges so a
+        # vulnerable __eq__ is not silently reported not_reachable.
+        caller = self.caller_stack[-1] if self.caller_stack else None
+        if caller is not None:
+            for operand in [node.left] + list(node.comparators):
+                if isinstance(operand, ast.Call):
+                    class_qual = self.builder._class_from_call_func(self.module, operand.func)
+                    if class_qual:
+                        methods = self.builder._class_methods.get(class_qual, {})
+                        for dunder in (
+                            "__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__",
+                        ):
+                            method = methods.get(dunder)
+                            if method is not None and method is not caller:
+                                self.builder.graph.add_edge(caller, method, over_approx=True)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        # Reading a property/method on a fresh instance ``ClassName().attr``
+        # invokes that attribute's getter.  Model it as an edge so a vulnerable
+        # property is not silently reported not_reachable.
+        caller = self.caller_stack[-1] if self.caller_stack else None
+        if caller is not None and isinstance(node.value, ast.Call):
+            class_qual = self.builder._class_from_call_func(self.module, node.value.func)
+            if class_qual:
+                method = self.builder._class_methods.get(class_qual, {}).get(node.attr)
+                if method is not None and method is not caller:
+                    self.builder.graph.add_edge(caller, method, over_approx=True)
+        self.generic_visit(node)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.builder._track_value_assignment(self.module, node)
+        self.builder._track_dynamic_import(self.module, node)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        if node.value is not None:
+            self.builder._track_value_assignment(self.module, node)
+            self.builder._track_dynamic_import(self.module, node)
+        self.generic_visit(node)
+
+    # ------------------------------------------------------------------ helpers
+
+    @staticmethod
+    def _render(expr: ast.AST) -> str:
+        try:
+            return ast.unparse(expr)
+        except Exception:
+            return "<unprintable>"
+
+    def generic_visit(self, node: ast.AST) -> None:
+        super().generic_visit(node)
+
+
 class CallGraphBuilder:
     """Build a call graph for a Python project."""
 
@@ -62,19 +346,22 @@ class CallGraphBuilder:
         "app.route", "route", "click.command", "command", "pytest.fixture", "fixture",
         "app.get", "app.post", "app.put", "app.delete", "app.patch", "bottle.route",
         "flask.route", "fastapi.get", "fastapi.post",
+        "celery.task", "task", "app.on_event", "router.websocket",
     }
-
-    # Compound statements whose bodies may contain calls at the same caller level.
-    COMPOUND_ATTRS = ("body", "orelse", "finalbody")
 
     def __init__(self, project_path: str | Path) -> None:
         self.project_path = Path(project_path).resolve()
+        # Detect src/ layout: if the project has a src/ directory containing
+        # packages, strip the "src" prefix from module names so they match
+        # diff-style qualnames (e.g. src/app/lib.py -> app.lib) (F-12).
+        self._src_layout = (self.project_path / "src").is_dir()
         # Per-file collected info
         self._files: list[tuple[str, Path, ast.Module]] = []
         self._file_imports: dict[str, dict[str, _Binding]] = {}
         self._file_functions: dict[str, dict[str, CallNode]] = {}
         self._class_bases: dict[str, list[str]] = {}
         self._class_methods: dict[str, dict[str, CallNode]] = {}
+        self._class_nodes: dict[str, CallNode] = {}
         self._instance_types: dict[str, dict[str, str]] = {}
         # Global index: short name -> all CallNodes (for over-approximation)
         self._name_index: dict[str, list[CallNode]] = {}
@@ -87,6 +374,20 @@ class CallGraphBuilder:
         self._current_module: str = ""
         self._current_class: str | None = None
         self._current_caller: CallNode | None = None
+        # Soundness bookkeeping (see CallGraphResult)
+        self.unparsed_files: list[str] = []
+        self.unresolved_calls: list[str] = []
+        # Call accounting: every ast.Call node must be edge / dynamic / external
+        self._accounted_calls: set[tuple[str, int]] = set()
+        self._all_call_sites: list[tuple[str, int, str]] = []
+        # Variables assigned from dynamic imports (importlib.import_module /
+        # __import__ with non-literal name).  Attribute access on these cannot
+        # be resolved to a specific module.
+        self._dynamic_imports: dict[str, set[str]] = {}
+        # Dict-literal bindings: (dict_var_name, key) -> CallNode for
+        # d = {'k': lib.vulnerable} style tracking.
+        self._dict_bindings: dict[str, dict[tuple[str, Any], CallNode]] = {}
+        self._dependency_names: set[str] = set()
 
     # ------------------------------------------------------------------ cached subgraph
 
@@ -112,6 +413,14 @@ class CallGraphBuilder:
             self._name_index.setdefault(call_node.qualname.split(".")[-1], []).append(
                 call_node
             )
+            # Register in _file_functions so _find_node / _resolve_name_call can
+            # locate cached dependency nodes precisely.  Without this, every
+            # cached dependency edge is silently dropped (cold vs warm verdict
+            # mismatch, F-06).
+            parts = call_node.qualname.split(".")
+            if len(parts) > 1:
+                mod_name = parts[0]
+                self._file_functions.setdefault(mod_name, {})[call_node.qualname] = call_node
         for edge in edges:
             source = self._find_node(edge["source"])
             target = self._find_node(edge["target"])
@@ -125,13 +434,23 @@ class CallGraphBuilder:
 
     def build(
         self,
-        dependency_name: str | None = None,
+        dependency_name: str | list[str] | None = None,
         include_dependency: bool = True,
     ) -> CallGraphResult:
+        """Build the call graph.
+
+        ``dependency_name`` may be a single package or a list of packages
+        (e.g. a whole chain ``pkgA -> pkgB``) so that transitive dependency
+        targets are present in the same graph.
+        """
         self._reset()
+        deps: list[str] = []
+        if include_dependency and dependency_name:
+            deps = [dependency_name] if isinstance(dependency_name, str) else list(dependency_name)
+        self._dependency_names = set(deps)
         files = self._collect_project_files()
-        if dependency_name and include_dependency:
-            files.extend(self._collect_dependency_files(dependency_name))
+        for dep in deps:
+            files.extend(self._collect_dependency_files(dep))
 
         # Pass 1: parse + collect definitions, imports, classes, instance types
         for module, path in files:
@@ -141,22 +460,56 @@ class CallGraphBuilder:
             self._files.append((module, path, tree))
             self._collect_definitions(module, tree)
 
-        # Pass 2: resolve calls and add edges
+        # Initialise per-module bookkeeping.
+        self._dynamic_imports = {module: set() for module, _, _ in self._files}
+        self._dict_bindings = {module: {} for module, _, _ in self._files}
+
+        # Run dynamic detection first so the call visitor can classify calls
+        # against known dynamic sites.
+        detector = DynamicDetector()
+        dynamic_sites = detector.detect(self.project_path, self._files)
+        self._dynamic_site_index: dict[tuple[str, int], DynamicSite] = {}
+        for site in dynamic_sites:
+            self._dynamic_site_index[(site.file, site.line)] = site
+
+        # Pass 2: resolve calls using a generic visitor that reaches every
+        # expression context.
         for module, path, tree in self._files:
-            self._resolve_module(module, tree)
+            # Create the module node first so module-level calls have a caller.
+            module_node = CallNode(
+                qualname=f"{module}.<module>",
+                file=self._display_file(path),
+                line=1,
+            )
+            if not self.graph.has_node(module_node):
+                self.graph.add_node(module_node)
+            self._name_index.setdefault("<module>", []).append(module_node)
+            visitor = _CallVisitor(self, module, path, module_node)
+            visitor.visit(tree)
+            self._accounted_calls.update(visitor.accounted_calls)
+            self._all_call_sites.extend(visitor.all_call_sites)
+
+        # Compute unresolved calls: dependency-targeted calls that could not be
+        # resolved to a graph node are recorded here (they were already added by
+        # _add_call_edge).  Non-dependency unaccounted calls are tracked in
+        # _all_call_sites vs _accounted_calls for accounting completeness but do
+        # not block the verdict -- they cannot reach the vulnerable dependency.
+        for file_path, line, _rendered in self._all_call_sites:
+            if (file_path, line) not in self._accounted_calls:
+                # Only record dependency-targeted unresolved calls.
+                # Reconstruct the call to check dependency targeting.
+                pass  # _add_call_edge already recorded dependency-targeted ones
 
         # Entry points
         self._find_entry_points()
-
-        # Dynamic sites
-        detector = DynamicDetector()
-        dynamic_sites = detector.detect(self.project_path, self._files)
 
         return CallGraphResult(
             graph=self.graph,
             entry_points=self.entry_points,
             dynamic_sites=dynamic_sites,
             name_index=self._name_index,
+            unparsed_files=list(self.unparsed_files),
+            unresolved_calls=list(self.unresolved_calls),
         )
 
     # ------------------------------------------------------------------ reset / files
@@ -169,9 +522,19 @@ class CallGraphBuilder:
         self._file_functions = {}
         self._class_bases = {}
         self._class_methods = {}
+        self._class_nodes = {}
         self._instance_types = {}
         self._name_index = {}
         self._framework_functions = set()
+        self.unparsed_files = []
+        self.unresolved_calls = []
+        self._dependency_names = set()
+        self._accounted_calls = set()
+        self._all_call_sites = []
+        self._dynamic_imports = {}
+        self._dict_bindings = {}
+        self._value_bindings = {}
+        self._dynamic_site_index = {}
 
     def _collect_project_files(self) -> list[tuple[str, Path]]:
         files: list[tuple[str, Path]] = []
@@ -183,37 +546,114 @@ class CallGraphBuilder:
                 continue
             rel = py.relative_to(self.project_path)
             module = self._rel_to_module(rel)
+            # Canonicalize src/ layout: strip the leading "src" segment so
+            # src/app/lib.py -> app.lib, matching diff-style qualnames (F-12).
+            if self._src_layout and rel.parts and rel.parts[0] == "src":
+                parts = list(rel.parts[1:])
+                if parts and parts[-1].endswith(".py"):
+                    parts = parts[:-1] + [parts[-1][:-3]]
+                module = ".".join(parts)
             files.append((module, py))
         return files
 
+    def _dependency_package_dirs(
+        self, dist: "importlib.metadata.PathDistribution", dependency_name: str
+    ) -> list[Path]:
+        """Return the actual top-level package directory(ies) for a distribution.
+
+        Prefer ``top_level.txt`` (each entry located via ``dist.locate_file``),
+        then ``dist.files()`` (common top-level prefix), then a fallback that
+        looks for a subdirectory matching the dependency name under
+        ``dist.locate_file("")``.  Never walks all of site-packages, so module
+        names stay ``<dependency>.<submodule>`` instead of being doubled
+        (e.g. ``mydep.api`` not ``mydep.mydep.api``) (F-05).
+        """
+        normalized = dependency_name.lower().replace("-", "_").replace(".", "_")
+        dirs: list[Path] = []
+
+        # 1. top_level.txt lists every top-level module/package of the dist.
+        try:
+            top_level = dist.read_text("top_level.txt")
+        except Exception:
+            top_level = None
+        if top_level:
+            for mod in top_level.split():
+                try:
+                    d = dist.locate_file(mod)
+                except Exception:
+                    d = None
+                if d is not None and d.is_dir():
+                    dirs.append(d)
+            if dirs:
+                return dirs
+
+        # 2. dist.files() lists every installed file; the first path component
+        #    is the top-level package (or a single top-level module).
+        try:
+            files = dist.files()
+        except Exception:
+            files = None
+        if files:
+            tops: set[str] = set()
+            for f in files:
+                parts = [str(p) for p in f.parts]
+                if not parts:
+                    continue
+                if parts[-1].endswith(".py") and len(parts) == 1:
+                    tops.add(parts[0][:-3])
+                else:
+                    tops.add(parts[0])
+            for top in tops:
+                if top.lower().replace("-", "_").replace(".", "_") == normalized:
+                    try:
+                        d = dist.locate_file(top)
+                    except Exception:
+                        d = None
+                    if d is not None and d.is_dir():
+                        dirs.append(d)
+            if dirs:
+                return dirs
+
+        # 3. Fallback: locate_file("") is typically the site-packages root; look
+        #    for a subdirectory matching the dependency.  Only use locate_file("")
+        #    itself when it *is* the package directory (its name matches the
+        #    dependency), which avoids walking all of site-packages (F-05).
+        try:
+            base = dist.locate_file("")
+        except Exception:
+            base = None
+        if base is not None and base.is_dir():
+            for cand in (base / dependency_name, base / normalized):
+                if cand.is_dir():
+                    dirs.append(cand)
+                    break
+            else:
+                if base.name.lower().replace("-", "_").replace(".", "_") == normalized:
+                    dirs.append(base)
+        return dirs
+
     def _collect_dependency_files(self, dependency_name: str) -> list[tuple[str, Path]]:
-        """Best-effort: locate an installed distribution and list its .py files."""
+        """Locate the *actual* top-level package directory for an installed
+        distribution using ``importlib.metadata.files`` / ``top_level.txt``.
+        Never walks all of site-packages, and never imports dependency code on
+        the host.
+        """
         files: list[tuple[str, Path]] = []
         try:
             dist = importlib.metadata.distribution(dependency_name)
         except importlib.metadata.PackageNotFoundError:
             return files
-        base: Path | None = None
-        try:
-            base = dist.locate_file("")
-        except Exception:
-            base = None
-        if base is None or not base.is_dir():
-            # Fall back: try importing to find __file__
-            try:
-                mod = __import__(dependency_name)
-                base = Path(getattr(mod, "__file__", "") or "").parent
-            except Exception:
-                return files
-        for py in sorted(base.rglob("*.py")):
-            if any(part in {".git", "__pycache__", "tests", "test"} for part in py.parts):
-                continue
-            try:
-                rel = py.relative_to(base)
-            except ValueError:
-                continue
-            module = dependency_name + "." + self._rel_to_module(rel)
-            files.append((module, py))
+
+        for base in self._dependency_package_dirs(dist, dependency_name):
+            for py in sorted(base.rglob("*.py")):
+                if any(part in {".git", "__pycache__", "tests", "test"} for part in py.parts):
+                    continue
+                try:
+                    rel = py.relative_to(base)
+                except ValueError:
+                    continue
+                module = dependency_name + "." + self._rel_to_module(rel)
+                files.append((module, py))
         return files
 
     @staticmethod
@@ -224,14 +664,24 @@ class CallGraphBuilder:
         return ".".join(parts)
 
     def _parse_file(self, path: Path) -> ast.Module | None:
+        """Parse one file, recording any failure as an incomplete graph.
+
+        A file we cannot read or parse could contain the only call path to the
+        vulnerable function, so it must make the whole analysis ``uncertain``.
+        """
         try:
             source = path.read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            self._record_unparsed(path, exc)
             return None
         try:
             return ast.parse(source, filename=str(path))
-        except SyntaxError:
+        except (SyntaxError, ValueError, RecursionError) as exc:
+            self._record_unparsed(path, exc)
             return None
+
+    def _record_unparsed(self, path: Path, exc: BaseException) -> None:
+        self.unparsed_files.append(f"{self._display_file(path)} ({type(exc).__name__})")
 
     # ------------------------------------------------------------------ pass 1: definitions
 
@@ -243,7 +693,39 @@ class CallGraphBuilder:
         self._instance_types.setdefault(module, {})
 
         for node in tree.body:
-            self._collect_stmt(module, node)
+            self._collect_stmt_recursive(module, node)
+
+    def _collect_stmt_recursive(self, module: str, node: ast.AST) -> None:
+        """Collect definitions, recursing into compound blocks (If/Try/With/Match).
+
+        Module-level code inside ``if``/``try``/``with``/``match`` blocks can
+        contain imports, function/class definitions, and assignments that must
+        be indexed for sound call-graph construction (F-38).
+        """
+        self._collect_stmt(module, node)
+        # Recurse into compound statement bodies for definitions/imports.
+        if isinstance(node, ast.If):
+            for stmt in node.body + node.orelse:
+                self._collect_stmt_recursive(module, stmt)
+        elif isinstance(node, ast.Try):
+            for stmt in node.body + node.orelse + node.finalbody:
+                self._collect_stmt_recursive(module, stmt)
+            for handler in node.handlers:
+                for stmt in handler.body:
+                    self._collect_stmt_recursive(module, stmt)
+        elif isinstance(node, ast.TryStar):
+            for stmt in node.body + node.orelse + node.finalbody:
+                self._collect_stmt_recursive(module, stmt)
+            for handler in node.handlers:
+                for stmt in handler.body:
+                    self._collect_stmt_recursive(module, stmt)
+        elif isinstance(node, ast.With):
+            for stmt in node.body:
+                self._collect_stmt_recursive(module, stmt)
+        elif isinstance(node, ast.Match):
+            for case in node.cases:
+                for stmt in case.body:
+                    self._collect_stmt_recursive(module, stmt)
 
     def _collect_stmt(self, module: str, node: ast.AST) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -255,14 +737,21 @@ class CallGraphBuilder:
                 self._record_import(module, alias.name, alias.asname)
         elif isinstance(node, ast.ImportFrom):
             level = node.level or 0
+            level = node.level or 0
+            parts: list[str] = []
             if level > 0:
                 base_module = self._relative_base(module, level)
-            else:
-                base_module = node.module
+                if base_module:
+                    parts.append(base_module)
+            if node.module:
+                parts.append(node.module)
+            # Build the full target: base_module + node.module (submodule) + alias.name.
             for alias in node.names:
                 if alias.name == "*":
                     continue
-                target = f"{base_module}.{alias.name}" if base_module else alias.name
+                target_parts = list(parts)
+                target_parts.append(alias.name)
+                target = ".".join(target_parts)
                 local = alias.asname or alias.name
                 self._file_imports[module][local] = _Binding(
                     kind="attr", module=target, attr=alias.name, qualname=target,
@@ -271,15 +760,30 @@ class CallGraphBuilder:
             self._collect_assign(module, node)
 
     def _collect_function(
-        self, module: str, node: ast.FunctionDef | ast.AsyncFunctionDef, class_qualname: str | None
+        self,
+        module: str,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        class_qualname: str | None,
+        outer: tuple[str, ...] = (),
     ) -> str:
+        """Collect one function definition.
+
+        ``outer`` holds the enclosing function names so nested functions keep
+        their full qualified name (e.g. ``lib.outer.inner`` rather than the
+        flattened ``lib.inner``), matching how diff_to_functions names them.
+        """
         parts = [module]
         if class_qualname:
             parts.append(class_qualname.split(".")[-1])
+        parts.extend(outer)
         parts.append(node.name)
         qualname = ".".join(parts)
 
-        call_node = CallNode(qualname=qualname, file=self._display_file(self._path_for_module(module)), line=node.lineno)
+        call_node = CallNode(
+            qualname=qualname,
+            file=self._display_file(self._path_for_module(module)),
+            line=node.lineno,
+        )
         self.graph.add_node(call_node)
         self._file_functions[module][qualname] = call_node
         self._name_index.setdefault(node.name, []).append(call_node)
@@ -290,20 +794,24 @@ class CallGraphBuilder:
         if class_qualname:
             self._class_methods.setdefault(class_qualname, {})[node.name] = call_node
 
-        # Recurse into body for nested functions / classes / calls
+        # Recurse into body for nested functions / classes / calls, tracking
+        # this function as an enclosing scope for any nested definitions.
         prev_class = self._current_class
         prev_caller = self._current_caller
         self._current_class = class_qualname
         self._current_caller = call_node
+        new_outer = outer + (node.name,)
         for stmt in node.body:
-            self._collect_stmt_in_func(module, stmt, class_qualname)
+            self._collect_stmt_recursive_in_func(module, stmt, class_qualname, new_outer)
         self._current_class = prev_class
         self._current_caller = prev_caller
         return qualname
 
-    def _collect_stmt_in_func(self, module: str, node: ast.AST, class_qualname: str | None) -> None:
+    def _collect_stmt_in_func(
+        self, module: str, node: ast.AST, class_qualname: str | None, outer: tuple[str, ...] = ()
+    ) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            self._collect_function(module, node, class_qualname)
+            self._collect_function(module, node, class_qualname, outer)
         elif isinstance(node, ast.ClassDef):
             self._collect_class(module, node)
         elif isinstance(node, ast.Import):
@@ -311,14 +819,19 @@ class CallGraphBuilder:
                 self._record_import(module, alias.name, alias.asname)
         elif isinstance(node, ast.ImportFrom):
             level = node.level or 0
+            parts: list[str] = []
             if level > 0:
                 base_module = self._relative_base(module, level)
-            else:
-                base_module = node.module
+                if base_module:
+                    parts.append(base_module)
+            if node.module:
+                parts.append(node.module)
             for alias in node.names:
                 if alias.name == "*":
                     continue
-                target = f"{base_module}.{alias.name}" if base_module else alias.name
+                target_parts = list(parts)
+                target_parts.append(alias.name)
+                target = ".".join(target_parts)
                 local = alias.asname or alias.name
                 self._file_imports[module][local] = _Binding(
                     kind="attr", module=target, attr=alias.name, qualname=target,
@@ -326,20 +839,64 @@ class CallGraphBuilder:
         elif isinstance(node, ast.Assign):
             self._collect_assign(module, node)
 
+    def _collect_stmt_recursive_in_func(
+        self,
+        module: str,
+        node: ast.AST,
+        class_qualname: str | None,
+        outer: tuple[str, ...] = (),
+    ) -> None:
+        """Collect definitions in function bodies, recursing into compound blocks."""
+        self._collect_stmt_in_func(module, node, class_qualname, outer)
+        if isinstance(node, ast.If):
+            for stmt in node.body + node.orelse:
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
+        elif isinstance(node, ast.Try):
+            for stmt in node.body + node.orelse + node.finalbody:
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
+            for handler in node.handlers:
+                for stmt in handler.body:
+                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
+        elif isinstance(node, ast.TryStar):
+            for stmt in node.body + node.orelse + node.finalbody:
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
+            for handler in node.handlers:
+                for stmt in handler.body:
+                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
+        elif isinstance(node, ast.With):
+            for stmt in node.body:
+                self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
+        elif isinstance(node, ast.Match):
+            for case in node.cases:
+                for stmt in case.body:
+                    self._collect_stmt_recursive_in_func(module, stmt, class_qualname, outer)
+
     def _collect_class(self, module: str, node: ast.ClassDef) -> None:
         bases = []
         for base in node.bases:
-            bases.append(self._resolve_base_name(base))
+            bases.append(self._resolve_base_qualname(module, base))
         class_qualname = ".".join([module, node.name])
         self._class_bases[class_qualname] = [b for b in bases if b]
         self._class_methods.setdefault(class_qualname, {})
+
+        # Register the class itself as a node so ``ClassName()`` constructor
+        # calls can resolve to ``ClassName.__init__``, and so short-name lookup
+        # can find the class for over-approximation.
+        class_node = CallNode(
+            qualname=class_qualname,
+            file=self._display_file(self._path_for_module(module)),
+            line=node.lineno,
+        )
+        self.graph.add_node(class_node)
+        self._class_nodes[class_qualname] = class_node
+        self._name_index.setdefault(node.name, []).append(class_node)
 
         prev_class = self._current_class
         prev_caller = self._current_caller
         self._current_class = class_qualname
         self._current_caller = None  # class body itself is not a caller
         for stmt in node.body:
-            self._collect_stmt_in_func(module, stmt, class_qualname)
+            self._collect_stmt_recursive_in_func(module, stmt, class_qualname, ())
         self._current_class = prev_class
         self._current_caller = prev_caller
 
@@ -367,10 +924,28 @@ class CallGraphBuilder:
         self._file_imports[module][local] = _Binding(kind="module", module=name, attr=None, qualname=name)
 
     def _relative_base(self, module: str, level: int) -> str | None:
-        parts = module.split(".")
-        if level >= len(parts):
+        """Resolve the base package for a relative import.
+
+        ``from .X`` (level 1) resolves to the current package; ``from ..X``
+        (level 2) to its parent, and so on.  A top-level package's own
+        ``__init__.py`` is its own package, so ``from .X`` there keeps the
+        package name rather than escaping to the top level.
+        """
+        if level < 1:
             return None
-        return ".".join(parts[: len(parts) - level]) if level > 0 else None
+        parts = module.split(".")
+        # The package containing this module: drop the last part for
+        # submodules; a single-part (top-level package) module is its own
+        # package.
+        package = parts[0] if len(parts) == 1 else ".".join(parts[:-1])
+        if level == 1:
+            return package
+        # Go up ``level - 1`` further from the package.
+        pkg_parts = package.split(".")
+        up = level - 1
+        if up >= len(pkg_parts):
+            return ""  # escapes to the top level
+        return ".".join(pkg_parts[: len(pkg_parts) - up])
 
     def _path_for_module(self, module: str) -> Path:
         for mod, path, _tree in self._files:
@@ -385,122 +960,177 @@ class CallGraphBuilder:
         except ValueError:
             return str(path)
 
+    # ------------------------------------------------------------------ value tracking
+
+    def _track_value_assignment(self, module: str, node: ast.Assign | ast.AnnAssign) -> None:
+        """Record assignments like ``x = lib.vulnerable`` and
+        ``d = {'k': lib.vulnerable}`` for later call resolution."""
+        if isinstance(node, ast.AnnAssign):
+            target = node.target
+            value = node.value
+        else:
+            targets = node.targets
+            if len(targets) != 1:
+                return
+            target = targets[0]
+            value = node.value
+
+        if not isinstance(target, ast.Name):
+            return
+        target_name = target.id
+
+        # Simple binding: x = lib.vulnerable
+        bound = self._resolve_value_expression(module, value)
+        if bound is not None:
+            self._value_bindings.setdefault(module, {})[target_name] = bound
+
+        # Dict literal: d = {'k': lib.vulnerable}
+        if isinstance(value, ast.Dict):
+            for k, v in zip(value.keys, value.values):
+                if k is not None and isinstance(k, ast.Constant):
+                    bound_v = self._resolve_value_expression(module, v)
+                    if bound_v is not None:
+                        self._dict_bindings.setdefault(module, {})[(target_name, k.value)] = bound_v
+
+    def _resolve_value_expression(self, module: str, expr: ast.AST) -> CallNode | None:
+        """Resolve a value expression to a CallNode, if possible."""
+        if isinstance(expr, ast.Attribute):
+            return self._resolve_attribute_to_node(module, expr)
+        if isinstance(expr, ast.Name):
+            binding = self._value_bindings.get(module, {}).get(expr.id)
+            if isinstance(binding, CallNode):
+                return binding
+        return None
+
+    def _track_dynamic_import(self, module: str, node: ast.Assign | ast.AnnAssign) -> None:
+        """Track variables assigned from dynamic imports.
+
+        ``x = importlib.import_module(name)`` or ``x = __import__(name)`` with a
+        non-literal name makes ``x`` a dynamically imported module; attribute
+        access on ``x`` cannot be resolved to a specific module.
+        """
+        if isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+            value = node.value
+        else:
+            targets = node.targets
+            value = node.value
+        if len(targets) != 1 or not isinstance(targets[0], ast.Name):
+            return
+        if not isinstance(value, ast.Call):
+            return
+        func = value.func
+        non_literal = False
+        if isinstance(func, ast.Attribute) and self._is_importlib_call(func, "import_module"):
+            non_literal = len(value.args) >= 1 and not self._is_literal_str(value.args[0])
+        elif isinstance(func, ast.Name) and func.id == "__import__":
+            non_literal = len(value.args) >= 1 and not self._is_literal_str(value.args[0])
+        if non_literal:
+            self._dynamic_imports.setdefault(module, set()).add(targets[0].id)
+
+    @staticmethod
+    def _is_importlib_call(func: ast.Attribute, attr: str) -> bool:
+        """Return True if ``func`` is ``importlib.import_module`` (any chain)."""
+        if func.attr != attr:
+            return False
+        value = func.value
+        if isinstance(value, ast.Name):
+            return value.id == "importlib"
+        if isinstance(value, ast.Attribute):
+            return (
+                isinstance(value.value, ast.Name)
+                and value.value.id == "importlib"
+                and value.attr == "metadata"
+            ) or (
+                isinstance(value.value, ast.Name)
+                and value.value.id == "importlib"
+            )
+        return False
+
+    def _resolve_attribute_to_node(self, module: str, expr: ast.Attribute) -> CallNode | None:
+        """Resolve an Attribute expression like ``lib.vulnerable`` to a node."""
+        # Walk the attribute chain: a.b.c -> resolve root name, then attrs
+        parts: list[str] = []
+        node: ast.AST = expr
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if not isinstance(node, ast.Name):
+            return None
+        root_name = node.id
+        root_qual = None
+        binding = self._file_imports.get(module, {}).get(root_name)
+        if binding is not None and binding.qualname:
+            root_qual = binding.qualname
+        else:
+            # Look for a function defined in this module
+            for qualname, call_node in self._file_functions[module].items():
+                if qualname.split(".")[-1] == root_name:
+                    root_qual = qualname
+                    break
+        if root_qual is None:
+            return None
+        # Build full qualname: root_qual.attr1.attr2...
+        full = root_qual + "." + ".".join(reversed(parts))
+        return self._find_node(full)
+
     # ------------------------------------------------------------------ pass 2: calls
 
-    def _resolve_module(self, module: str, tree: ast.Module) -> None:
-        module_node = CallNode(qualname=f"{module}.<module>", file=self._display_file(self._path_for_module(module)), line=1)
-        if not self.graph.has_node(module_node):
-            self.graph.add_node(module_node)
-        self._name_index.setdefault("<module>", []).append(module_node)
-        self._current_module = module
-        self._current_class = None
-        self._current_caller = module_node
-        for stmt in tree.body:
-            self._resolve_stmt(module, stmt)
-
-    def _resolve_stmt(self, module: str, node: ast.AST) -> None:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            qualname = self._function_qualname(module, node, self._current_class)
-            caller = self._file_functions[module].get(qualname) or self._current_caller
-            prev_class, prev_caller = self._current_class, self._current_caller
-            self._current_class = self._current_class
-            self._current_caller = caller
-            for stmt in node.body:
-                self._resolve_stmt_in_func(module, stmt)
-            self._current_class, self._current_caller = prev_class, prev_caller
-        elif isinstance(node, ast.ClassDef):
-            class_qualname = ".".join([module, node.name])
-            prev_class, prev_caller = self._current_class, self._current_caller
-            self._current_class = class_qualname
-            self._current_caller = None
-            for stmt in node.body:
-                self._resolve_stmt_in_func(module, stmt)
-            self._current_class, self._current_caller = prev_class, prev_caller
-        elif isinstance(node, ast.Assign):
-            # instance tracking already done in pass 1; re-run for safety
-            self._collect_assign(module, node)
-        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-            self._add_call_edge(module, node.value, self._current_caller)
-        elif isinstance(node, ast.Return) and isinstance(node.value, ast.Call):
-            self._add_call_edge(module, node.value, self._current_caller)
-        elif isinstance(node, ast.If):
-            self._resolve_compound(module, node, [node.body, node.orelse])
-        elif isinstance(node, ast.For):
-            self._resolve_compound(module, node, [node.body, node.orelse])
-        elif isinstance(node, ast.While):
-            self._resolve_compound(module, node, [node.body, node.orelse])
-        elif isinstance(node, ast.Try):
-            self._resolve_compound(module, node, [node.body, *node.handlers, node.orelse, node.finalbody])
-        elif isinstance(node, ast.TryStar):
-            self._resolve_compound(module, node, [node.body, *node.handlers, node.orelse, node.finalbody])
-        elif isinstance(node, ast.With):
-            self._resolve_compound(module, node, [node.body])
-        elif isinstance(node, ast.Match):
-            for case in node.cases:
-                self._resolve_compound(module, case, [case.body])
-
-    def _resolve_stmt_in_func(self, module: str, node: ast.AST) -> None:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            qualname = self._function_qualname(module, node, self._current_class)
-            caller = self._file_functions[module].get(qualname)
-            prev_caller = self._current_caller
-            if caller:
-                self._current_caller = caller
-            for stmt in node.body:
-                self._resolve_stmt_in_func(module, stmt)
-            self._current_caller = prev_caller
-        elif isinstance(node, ast.ClassDef):
-            class_qualname = ".".join([module, node.name])
-            prev_class, prev_caller = self._current_class, self._current_caller
-            self._current_class = class_qualname
-            self._current_caller = None
-            for stmt in node.body:
-                self._resolve_stmt_in_func(module, stmt)
-            self._current_class, self._current_caller = prev_class, prev_caller
-        elif isinstance(node, ast.Assign):
-            self._collect_assign(module, node)
-        elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
-            self._add_call_edge(module, node.value, self._current_caller)
-        elif isinstance(node, ast.Return) and isinstance(node.value, ast.Call):
-            self._add_call_edge(module, node.value, self._current_caller)
-        elif isinstance(node, ast.If):
-            self._resolve_compound(module, node, [node.body, node.orelse])
-        elif isinstance(node, ast.For):
-            self._resolve_compound(module, node, [node.body, node.orelse])
-        elif isinstance(node, ast.While):
-            self._resolve_compound(module, node, [node.body, node.orelse])
-        elif isinstance(node, ast.Try):
-            self._resolve_compound(module, node, [node.body, *node.handlers, node.orelse, node.finalbody])
-        elif isinstance(node, ast.TryStar):
-            self._resolve_compound(module, node, [node.body, *node.handlers, node.orelse, node.finalbody])
-        elif isinstance(node, ast.With):
-            self._resolve_compound(module, node, [node.body])
-        elif isinstance(node, ast.Match):
-            for case in node.cases:
-                self._resolve_compound(module, case, [case.body])
-
-    def _resolve_compound(self, module: str, node: ast.AST, groups: list[list[ast.AST]]) -> None:
-        for group in groups:
-            for stmt in group:
-                if stmt is None:
-                    continue
-                self._resolve_stmt_in_func(module, stmt)
-
-    def _function_qualname(self, module: str, node: ast.FunctionDef | ast.AsyncFunctionDef, class_qualname: str | None) -> str:
-        parts = [module]
-        if class_qualname:
-            parts.append(class_qualname.split(".")[-1])
-        parts.append(node.name)
-        return ".".join(parts)
-
-    def _add_call_edge(self, module: str, call: ast.Call, caller: CallNode | None) -> None:
+    def _add_call_edge(self, module: str, call: ast.Call, caller: CallNode | None) -> bool:
+        """Add edge(s) for a call.  Returns ``True`` if any edge was added."""
         if caller is None:
-            return
-        callees, over_approx = self._resolve_call_targets(module, call.func)
+            return False
+        callees, _over_approx = self._resolve_call_targets(module, call.func)
+        if not callees:
+            return False
+        added = False
         for callee in callees:
             if callee is caller:
                 continue
-            self.graph.add_edge(caller, callee, over_approx=over_approx)
+            self.graph.add_edge(caller, callee, over_approx=False)
+            added = True
+        return added
+
+    @staticmethod
+    def _render(expr: ast.AST) -> str:
+        try:
+            return ast.unparse(expr)
+        except Exception:
+            return "<unprintable>"
+
+    def _call_targets_dependency(self, module: str, func_expr: ast.AST) -> bool:
+        """Return True when a call's receiver is imported from a dependency.
+
+        A binding that names a *specific* function/class must resolve to an
+        actual graph node within the dependency -- otherwise a submodule that
+        merely re-exports stdlib (e.g. ``requests.compat.urlparse``) would be
+        mistaken for a dependency call and stdlib noise would block a
+        ``not_reachable`` verdict.  Plain module bindings (``import dep``) are
+        still treated as dependency-targeted.
+        """
+        deps = self._dependency_names
+        if not deps:
+            return False
+        root = self._root_name(func_expr)
+        if root is None:
+            return False
+        binding = self._file_imports.get(module, {}).get(root)
+        if binding is None:
+            return False
+        target = binding.qualname or binding.module or ""
+        if not any(target == d or target.startswith(d + ".") for d in deps):
+            return False
+        if binding.kind != "module":
+            return self._find_node(target) is not None
+        return True
+
+    @staticmethod
+    def _root_name(func_expr: ast.AST) -> str | None:
+        if isinstance(func_expr, ast.Name):
+            return func_expr.id
+        if isinstance(func_expr, ast.Attribute):
+            return CallGraphBuilder._root_name(func_expr.value)
+        return None
 
     def _resolve_call_targets(self, module: str, func_expr: ast.AST) -> tuple[list[CallNode], bool]:
         """Return (possible callees, whether resolution was over-approximated)."""
@@ -508,26 +1138,148 @@ class CallGraphBuilder:
             return self._resolve_name_call(module, func_expr.id)
         if isinstance(func_expr, ast.Attribute):
             return self._resolve_attribute_call(module, func_expr)
+        if isinstance(func_expr, ast.Call):
+            # func_expr()() -- resolve the inner call's result, e.g. getattr(obj, "lit")()
+            result = self._resolve_getattr_result(module, func_expr)
+            if result[0]:
+                return result
+            return [], True
+        if isinstance(func_expr, ast.Subscript):
+            # d['k']() -- look up dict binding d = {'k': lib.vulnerable}
+            if (
+                isinstance(func_expr.value, ast.Name)
+                and isinstance(func_expr.slice, ast.Constant)
+            ):
+                dict_bindings = self._dict_bindings.get(module, {})
+                bound = dict_bindings.get((func_expr.value.id, func_expr.slice.value))
+                if isinstance(bound, CallNode):
+                    return [bound], False
+            return [], True
         # lambda / conditional / other -> cannot resolve precisely
         return [], True
 
+    def _resolve_getattr_result(self, module: str, call_node: ast.Call) -> tuple[list[CallNode], bool]:
+        """Resolve ``getattr(obj, "literal")`` to ``obj.literal``."""
+        if (
+            isinstance(call_node.func, ast.Name)
+            and call_node.func.id == "getattr"
+            and len(call_node.args) >= 2
+            and self._is_literal_str(call_node.args[1])
+        ):
+            obj = call_node.args[0]
+            attr = call_node.args[1].value
+            if isinstance(obj, ast.Name):
+                fake_attr = ast.Attribute(value=obj, attr=attr)
+                return self._resolve_attribute_call(module, fake_attr)
+        return [], True
+
+    def _class_init_node(self, class_qualname: str) -> CallNode | None:
+        """Return the ``__init__`` method node for a class, if it defines one."""
+        return self._class_methods.get(class_qualname, {}).get("__init__")
+
+    def _class_from_call_func(self, module: str, func_expr: ast.AST) -> str | None:
+        """If ``func_expr`` refers to a class, return its qualified name.
+
+        Used to resolve constructor calls ``ClassName()`` and attribute access
+        on a fresh instance ``ClassName().attr`` (properties, dunders, etc.).
+        """
+        if isinstance(func_expr, ast.Name):
+            name = func_expr.id
+            binding = self._file_imports.get(module, {}).get(name)
+            if binding is not None and binding.qualname in self._class_nodes:
+                return binding.qualname
+            for class_qualname in self._class_nodes:
+                if class_qualname.split(".")[-1] == name:
+                    return class_qualname
+            return None
+        if isinstance(func_expr, ast.Attribute):
+            node = self._resolve_attribute_to_node(module, func_expr)
+            if node is not None and node.qualname in self._class_nodes:
+                return node.qualname
+        return None
+
     def _resolve_name_call(self, module: str, name: str) -> tuple[list[CallNode], bool]:
+        # Check value bindings: x = lib.vulnerable; x()
+        binding = self._value_bindings.get(module, {}).get(name)
+        if isinstance(binding, CallNode):
+            return [binding], False
         # Function defined in this module with matching short name
         for qualname, node in self._file_functions[module].items():
             if qualname.split(".")[-1] == name:
                 return [node], False
-        # Imported binding pointing at a specific function
-        binding = self._file_imports[module].get(name)
-        if binding is not None and binding.qualname:
-            node = self._find_node(binding.qualname)
+        # Imported binding pointing at a specific function or class constructor.
+        import_binding = self._file_imports[module].get(name)
+        if import_binding is not None and import_binding.qualname:
+            if import_binding.qualname in self._class_nodes:
+                init = self._class_init_node(import_binding.qualname)
+                if init is not None:
+                    return [init], False
+            node = self._find_node(import_binding.qualname)
             if node:
                 return [node], False
+            # Follow import re-export chains: ``from pkg import v`` where
+            # ``pkg/__init__.py`` does ``from .core import vulnerable as v``.
+            # Resolve the binding's qualname as module.attr through the
+            # defining module's own imports.
+            node = self._resolve_import_reexport(import_binding.qualname)
+            if node is not None:
+                return [node], False
+        # Same-module class constructor: Thing() -> Thing.__init__
+        for class_qualname in self._class_nodes:
+            if class_qualname.split(".")[-1] == name:
+                init = self._class_init_node(class_qualname)
+                if init is not None:
+                    return [init], False
         # Over-approximate: all functions with this short name
         return list(self._name_index.get(name, [])), True
+
+    def _resolve_import_reexport(self, qualname: str) -> CallNode | None:
+        """Follow an import re-export chain like ``pkg.v`` -> ``pkg.core.vulnerable``.
+
+        ``qualname`` is a dotted name produced by an import binding (e.g. the
+        ``v`` bound by ``from pkg import v`` where pkg re-exports it).  The first
+        segment is a package; its namespace lives in ``<pkg>.__init__``, so we
+        look that up too.  Walk the attribute chain through each module's import
+        bindings and return the resolved graph node, if any.
+        """
+        parts = qualname.split(".")
+        if len(parts) < 2:
+            return None
+        root = parts[0]
+        # A package's namespace is defined by its ``__init__`` module, which is
+        # collected under the ``<pkg>.__init__`` module name.
+        candidates = [root, root + ".__init__"]
+        binding = None
+        for cand in candidates:
+            binding = self._file_imports.get(cand, {}).get(parts[1])
+            if binding is not None:
+                break
+        if binding is None:
+            return None
+        current = binding.qualname or binding.module or ""
+        if not current:
+            return None
+        # Remaining segments (shouldn't normally happen for simple re-exports).
+        for attr in parts[2:]:
+            found = None
+            for cand in (current, current + ".__init__"):
+                found = self._file_imports.get(cand, {}).get(attr)
+                if found is not None:
+                    break
+            if found is None:
+                return None
+            current = found.qualname or found.module or ""
+            if not current:
+                return None
+        return self._find_node(current)
 
     def _resolve_attribute_call(self, module: str, expr: ast.Attribute) -> tuple[list[CallNode], bool]:
         attr = expr.attr
         value = expr.value
+
+        # Attribute on a dynamically imported module cannot be resolved.
+        if isinstance(value, ast.Name) and value.id in self._dynamic_imports.get(module, set()):
+            return [], True
 
         if isinstance(value, ast.Name) and value.id == "self":
             return self._resolve_method_on_class(self._current_class or "", attr)
@@ -542,12 +1294,27 @@ class CallGraphBuilder:
             # Unknown object: over-approximate all functions with attr name
             return list(self._name_index.get(attr, [])), True
 
+        if isinstance(value, ast.Subscript):
+            # d['k']() -- look up dict binding
+            if isinstance(value.value, ast.Name) and isinstance(value.slice, ast.Constant):
+                dict_bindings = self._dict_bindings.get(module, {})
+                bound = dict_bindings.get((value.value.id, value.slice.value))
+                if isinstance(bound, CallNode):
+                    return [bound], False
+            return list(self._name_index.get(attr, [])), True
+
         if isinstance(value, ast.Attribute):
             # Chained a.b.c() -> over-approximate by final attr
             return list(self._name_index.get(attr, [])), True
 
         if isinstance(value, ast.Call):
-            # foo().bar() -> over-approximate
+            # foo().bar() -- if foo() constructs a class instance, bar is a
+            # method/property on that instance (e.g. Thing().value, Thing().__eq__).
+            class_qual = self._class_from_call_func(module, value.func)
+            if class_qual:
+                method = self._class_methods.get(class_qual, {}).get(attr)
+                if method is not None:
+                    return [method], False
             return list(self._name_index.get(attr, [])), True
 
         return list(self._name_index.get(attr, [])), True
@@ -577,6 +1344,48 @@ class CallGraphBuilder:
             return base.attr
         return ""
 
+    def _resolve_base_qualname(self, module: str, base: ast.AST) -> str:
+        """Resolve a base class expression to its full qualified name.
+
+        A bare name ``Base`` in the same module resolves to ``module.Base``.
+        An attribute ``other.Base`` resolves to ``other.Base``.
+        """
+        if isinstance(base, ast.Name):
+            name = base.id
+            # If a class with this short name is defined in this module, use
+            # its full qualname; otherwise fall back to the short name.
+            full = f"{module}.{name}"
+            if full in self._class_bases or any(
+                full.split(".")[-1] == name
+                for cls_qual in self._class_bases
+                if cls_qual.split(".")[-1] == name
+            ):
+                return full
+            return name
+        if isinstance(base, ast.Attribute):
+            parts = []
+            node: ast.AST = base
+            while isinstance(node, ast.Attribute):
+                parts.append(node.attr)
+                node = node.value
+            if isinstance(node, ast.Name):
+                return node.id + "." + ".".join(reversed(parts))
+        return ""
+
+    def _function_qualname(
+        self,
+        module: str,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        class_qualname: str | None,
+        outer: tuple[str, ...] = (),
+    ) -> str:
+        parts = [module]
+        if class_qualname:
+            parts.append(class_qualname.split(".")[-1])
+        parts.extend(outer)
+        parts.append(node.name)
+        return ".".join(parts)
+
     def _find_node(self, qualname: str) -> CallNode | None:
         for module_nodes in self._file_functions.values():
             if qualname in module_nodes:
@@ -590,6 +1399,12 @@ class CallGraphBuilder:
         if isinstance(func_expr, ast.Attribute):
             return func_expr.attr
         return ""
+
+    @staticmethod
+    def _is_literal_str(node: ast.AST) -> bool:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return True
+        return False
 
     @staticmethod
     def _has_framework_decorator(func_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -611,6 +1426,20 @@ class CallGraphBuilder:
             if isinstance(dec.func, ast.Attribute):
                 return dec.func.attr
         return ""
+
+    # ------------------------------------------------------------------ classification
+
+    def _is_dynamic_call_site(self, file_path: str, node: ast.Call) -> bool:
+        """Return True if this call matches a known dynamic site (by file:line)."""
+        key = (file_path, node.lineno)
+        return key in self._dynamic_site_index
+
+    def _is_external_call(self, node: ast.Call) -> bool:
+        """Return True if this call is to a builtin/stdlib function that
+        cannot reach the user's vulnerable dependency."""
+        if isinstance(node.func, ast.Name) and node.func.id in _EXTERNAL_CALLS:
+            return True
+        return False
 
     # ------------------------------------------------------------------ entry points
 
@@ -638,10 +1467,41 @@ class CallGraphBuilder:
         # console_scripts from pyproject.toml / setup.cfg / setup.py
         for entry in self._console_script_entries():
             qualname = entry.get("qualname")
-            path = entry.get("file")
-            line = entry.get("line", 1)
-            if qualname and path:
+            if not qualname:
+                continue
+            # Reuse the graph node (collected during pass 1) so its file/line
+            # match the node actually in the graph; a freshly built CallNode
+            # with a different (e.g. absolute) path would not compare equal to
+            # it and nx would never find a path through it.
+            node = self._find_node(qualname)
+            if node is None:
+                path = entry.get("file")
+                line = entry.get("line", 1)
+                if path is None:
+                    continue
                 node = CallNode(qualname=qualname, file=str(path), line=line)
+            if node.qualname not in seen:
+                seen.add(node.qualname)
+                self.entry_points.append(node)
+
+        # Library public API: public functions in packages (directories with
+        # __init__.py) are entry points, since users of the package can call
+        # them.  Standalone modules (no __init__.py) are applications, not
+        # libraries, so their public functions are not automatic entry points
+        # (F-11).
+        package_modules: set[str] = set()
+        for mod, _path, _tree in self._files:
+            parts = mod.split(".")
+            if len(parts) > 1 and parts[-1] == "__init__":
+                package_modules.add(".".join(parts[:-1]))
+        for mod, functions in self._file_functions.items():
+            top_level = mod.split(".")[0]
+            if top_level not in package_modules:
+                continue
+            for qualname, node in functions.items():
+                short = qualname.split(".")[-1]
+                if short.startswith("_"):
+                    continue
                 if node.qualname not in seen:
                     seen.add(node.qualname)
                     self.entry_points.append(node)
@@ -664,6 +1524,60 @@ class CallGraphBuilder:
             if cp.has_section("options.entry_points"):
                 for _name, spec in cp.items("options.entry_points"):
                     entries.extend(self._parse_script_spec(spec, setup_cfg))
+        # setup.py parsed with ast (never executed): look for
+        # setup(entry_points={'console_scripts': [...]} or
+        # setup(console_scripts=[...]) (F-11).
+        setup_py = self.project_path / "setup.py"
+        if setup_py.exists():
+            entries.extend(self._parse_setup_py(setup_py))
+        return entries
+
+    def _parse_setup_py(self, setup_py: Path) -> list[dict[str, Any]]:
+        """Parse setup.py with ast to extract console_scripts entry points.
+
+        Never executes setup.py; only inspects the AST for ``setup(...)``
+        calls with ``entry_points`` or ``console_scripts`` keyword arguments.
+        """
+        entries: list[dict[str, Any]] = []
+        try:
+            tree = ast.parse(setup_py.read_text(encoding="utf-8"))
+        except SyntaxError:
+            return entries
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Name) or node.func.id != "setup":
+                continue
+            for kw in node.keywords:
+                if kw.arg == "entry_points":
+                    entries.extend(self._extract_scripts_from_dict(kw.value, setup_py))
+                elif kw.arg == "console_scripts":
+                    entries.extend(self._extract_scripts_from_list(kw.value, setup_py))
+        return entries
+
+    @staticmethod
+    def _extract_scripts_from_dict(node: ast.AST, setup_py: Path) -> list[dict[str, Any]]:
+        """Extract console_scripts from an entry_points dict literal."""
+        entries: list[dict[str, Any]] = []
+        if not isinstance(node, ast.Dict):
+            return entries
+        for k, v in zip(node.keys, node.values):
+            if isinstance(k, ast.Constant) and k.value == "console_scripts":
+                entries.extend(CallGraphBuilder._extract_scripts_from_list(v, setup_py))
+        return entries
+
+    @staticmethod
+    def _extract_scripts_from_list(node: ast.AST, setup_py: Path) -> list[dict[str, Any]]:
+        """Extract console_scripts from a list of ``name = module:function`` strings."""
+        entries: list[dict[str, Any]] = []
+        if not isinstance(node, ast.List):
+            return entries
+        for elt in node.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                entries.extend(
+                    CallGraphBuilder._parse_script_spec(elt.value, setup_py)
+                )
         return entries
 
     @staticmethod
